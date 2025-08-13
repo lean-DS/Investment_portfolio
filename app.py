@@ -43,7 +43,7 @@ SESSION.headers.update({
 })
 TIMEOUT = 12
 
-ALPHA_KEY = os.getenv("ALPHAVANTAGE_API_KEY", "").strip()
+ALPHA_KEY = os.getenv("ALPHAVANTAGE_API_KEY", "QC0N0N5TH9FGZIN6").strip()
 
 CACHE_DIR = Path("data_cache")
 CACHE_DIR.mkdir(exist_ok=True)
