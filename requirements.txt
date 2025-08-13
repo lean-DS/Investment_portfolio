@@ -7,3 +7,4 @@ beautifulsoup4==4.12.3
 tqdm==4.66.4
 lxml==4.9.4
 html5lib==1.1
+pandas-datareader==0.10.0
