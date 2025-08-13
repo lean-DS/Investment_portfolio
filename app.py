@@ -7,27 +7,30 @@ Original file is located at
     https://colab.research.google.com/drive/1mr7eYs1wORNswHObAutUZr2M6e9i2vf0
 """
 
-import streamlit as st
-import pandas as pd
-import numpy as np
-import yfinance as yf
-from typing import List, Tuple
-import os, time, json, random, hashlib
+# app.py
+import os
+import time
 from datetime import datetime, timedelta
+from typing import List, Tuple
 
-# ------------------- Page Setup ------------------- #
+import numpy as np
+import pandas as pd
+import streamlit as st
+import yfinance as yf
+
+# ===================== Streamlit Page Setup =====================
 st.set_page_config(page_title="AI Portfolio Recommender", layout="wide")
 st.title("AI Portfolio Recommender")
 
-# ------------------- Step 1: Investor Inputs ------------------- #
+# ===================== Investor Inputs =====================
 st.header("Investor Profile")
 
-col1, col2, col3 = st.columns(3)
-with col1:
+c1, c2, c3 = st.columns(3)
+with c1:
     age = st.number_input("Age", min_value=18, max_value=100, value=30)
-with col2:
+with c2:
     goal = st.selectbox("Investment Goal", ["Capital Growth", "Dividend Income", "Balanced"])
-with col3:
+with c3:
     horizon = st.slider("Investment Horizon (years)", 1, 10, 3)
 
 amount = st.number_input("Investment Amount (in Pounds)", min_value=1000, step=1000, value=10000)
@@ -65,9 +68,9 @@ if st.button("Build Dynamic Universe"):
         risk_profile=risk_profile, min_beta=float(min_beta), max_beta=float(max_beta),
         equity_percent=int(equity_percent), debt_percent=int(debt_percent)
     )
-    st.experimental_rerun()
+    st.rerun()
 
-# ===================== Helpers (single-file) ===================== #
+# ===================== Helpers =====================
 def _flatten_columns(df: pd.DataFrame) -> pd.DataFrame:
     if isinstance(df.columns, pd.MultiIndex):
         df.columns = [' '.join([str(x) for x in tup if x is not None]).strip()
@@ -84,14 +87,36 @@ def _find_ticker_col(df: pd.DataFrame) -> str | None:
     return None
 
 def _download_ohlcv(ticker: str) -> pd.DataFrame | None:
-    df = yf.download(ticker, period="2y", interval="1d", progress=False, auto_adjust=False)
-    if df is None or df.empty: return None
-    return df
+    try:
+        df = yf.download(ticker, period="2y", interval="1d", progress=False, auto_adjust=False, threads=False)
+        if df is None or df.empty: return None
+        return df
+    except Exception:
+        return None
 
-def _download_index_close(symbol: str = "ACWI") -> pd.Series | None:
-    df = yf.download(symbol, period="2y", interval="1d", progress=False)
-    if df is None or df.empty or "Close" not in df.columns: return None
-    return df["Close"].dropna()
+def _retry_download(symbol: str, retries: int = 3, wait: float = 0.8) -> pd.DataFrame | None:
+    for i in range(retries):
+        try:
+            df = yf.download(symbol, period="2y", interval="1d", progress=False, threads=False)
+            if df is not None and not df.empty:
+                return df
+        except Exception:
+            pass
+        time.sleep(wait)
+    return None
+
+def _download_index_close(symbols=("ACWI", "^GSPC", "^FTSE")) -> pd.Series | None:
+    """
+    Try ACWI first; if it fails, fall back to S&P500 (^GSPC) or FTSE.
+    Includes small retry logic for Cloud Run/Yahoo hiccups.
+    """
+    for sym in symbols:
+        df = _retry_download(sym, retries=3, wait=0.8)
+        if df is not None and "Close" in df.columns:
+            ser = df["Close"].dropna()
+            if not ser.empty:
+                return ser
+    return None
 
 def _calculate_beta_vs(close_stock: pd.Series, close_bench: pd.Series) -> float | None:
     sret = close_stock.pct_change().dropna()
@@ -104,7 +129,7 @@ def _calculate_beta_vs(close_stock: pd.Series, close_bench: pd.Series) -> float 
     beta = aligned.cov().iloc[0,1] / bvar
     return round(float(beta), 2)
 
-# ---------- US/UK universes ----------
+# ---------------- Universes: US + UK ----------------
 @st.cache_data(show_spinner=False, ttl=3600)
 def fetch_sp500_universe(max_names: int = 600) -> List[str]:
     url = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
@@ -146,34 +171,9 @@ def universal_equity_universe() -> List[str]:
     uk = list(set(fetch_ftse_100() + fetch_ftse_250()))
     return list(dict.fromkeys(us + uk))
 
-# ---------- Debt ETF scrapers (multi-source with caching) ----------
-_CACHE_DIR = ".cache_etfs"
-os.makedirs(_CACHE_DIR, exist_ok=True)
-
-def _cache_path(key: str) -> str:
-    return os.path.join(_CACHE_DIR, hashlib.md5(key.encode()).hexdigest() + ".json")
-
-def _load_cache(key: str, ttl_hours: int = 24):
-    p = _cache_path(key)
-    if not os.path.exists(p): return None
-    try:
-        mtime = datetime.fromtimestamp(os.path.getmtime(p))
-        if datetime.utcnow() - mtime > timedelta(hours=ttl_hours): return None
-        with open(p, "r") as f: return json.load(f)
-    except Exception:
-        return None
-
-def _save_cache(key: str, data):
-    try:
-        with open(_cache_path(key), "w") as f: json.dump(data, f)
-    except Exception:
-        pass
-
+# ---------------- Debt ETFs (dynamic, US + UK from Wikipedia; ranked by liquidity) ----------------
+@st.cache_data(show_spinner=False, ttl=86400)
 def _scrape_us_bond_etfs() -> pd.DataFrame:
-    key = "us_bond_etfs_wiki"
-    cached = _load_cache(key)
-    if cached is not None:
-        return pd.DataFrame(cached)
     url = "https://en.wikipedia.org/wiki/List_of_American_exchange-traded_funds"
     try:
         dfs = pd.read_html(url)
@@ -185,7 +185,8 @@ def _scrape_us_bond_etfs() -> pd.DataFrame:
         tick_col = next((c for c in t.columns if "ticker" in str(c).lower() or "symbol" in str(c).lower()), None)
         name_col = next((c for c in t.columns if "name" in str(c).lower() or "fund" in str(c).lower()), None)
         asset_col = next((c for c in t.columns if "asset" in str(c).lower()), None)
-        if tick_col is None: continue
+        if tick_col is None: 
+            continue
         temp = t.copy()
         temp["__ticker__"] = temp[tick_col].astype(str).str.upper().str.strip()
         temp["__name__"]   = temp[name_col].astype(str) if name_col is not None else ""
@@ -201,15 +202,11 @@ def _scrape_us_bond_etfs() -> pd.DataFrame:
     out = pd.concat(rows, ignore_index=True).drop_duplicates("Ticker") if rows else pd.DataFrame(columns=["Ticker","Name"])
     if not out.empty:
         out["Ticker"] = out["Ticker"].astype(str).str.upper().str.strip()
-        out = out[~out["Ticker"].str.endswith(".L")]
-    _save_cache(key, out.to_dict(orient="records"))
+        out = out[~out["Ticker"].str.endswith(".L")]  # keep US tickers here
     return out
 
+@st.cache_data(show_spinner=False, ttl=86400)
 def _scrape_uk_bond_etfs() -> pd.DataFrame:
-    key = "uk_bond_etfs_wiki"
-    cached = _load_cache(key)
-    if cached is not None:
-        return pd.DataFrame(cached)
     urls = [
         "https://en.wikipedia.org/wiki/List_of_Exchange-traded_funds_listed_on_the_London_Stock_Exchange",
         "https://en.wikipedia.org/wiki/List_of_exchange-traded_funds"
@@ -224,7 +221,8 @@ def _scrape_uk_bond_etfs() -> pd.DataFrame:
             t = _flatten_columns(t)
             tick_col = next((c for c in t.columns if any(k in str(c).lower() for k in ["ticker","epic","symbol"])), None)
             name_col = next((c for c in t.columns if any(k in str(c).lower() for k in ["name","fund","etf"])), None)
-            if tick_col is None: continue
+            if tick_col is None: 
+                continue
             temp = t.copy()
             temp["__ticker__"] = temp[tick_col].astype(str).str.upper().str.replace(" ", "", regex=False).str.strip()
             temp["__name__"]   = temp[name_col].astype(str) if name_col is not None else ""
@@ -237,7 +235,6 @@ def _scrape_uk_bond_etfs() -> pd.DataFrame:
     if not out.empty:
         out["Ticker"] = out["Ticker"].astype(str)
         out["Ticker"] = out["Ticker"].apply(lambda x: x if x.endswith(".L") else f"{x}.L")
-    _save_cache(key, out.to_dict(orient="records"))
     return out
 
 def _validate_rank_debt(tickers: List[str], want: int) -> pd.DataFrame:
@@ -255,7 +252,7 @@ def _validate_rank_debt(tickers: List[str], want: int) -> pd.DataFrame:
              .reset_index(drop=True))
     return out
 
-# ---------- Goal & horizon features ----------
+# ---------------- Features for scoring ----------------
 def _total_return(close: pd.Series, days: int) -> float:
     if len(close) < days + 1: return np.nan
     return float(close.iloc[-1] / close.iloc[-1 - days] - 1.0)
@@ -296,21 +293,30 @@ def _equity_weights(goal: str, horizon_years: int) -> dict:
         return {"yield":0.55 if not short else 0.45, "vol":0.15, "dd":0.15, "mom3":0.05, "mom6":0.05, "mom12":0.05}
     return {"mom3":0.20 if short else 0.15, "mom6":0.20, "mom12":0.20, "vol":0.15, "dd":0.15, "yield":0.10 if not short else 0.05}
 
-# ---------- Main picker ----------
-def dynamic_universal_picker(user_inputs: dict,
-    scan_cap_us: int = 250, scan_cap_uk: int = 200,
-    want_equities: int = 50, want_debt: int = 30) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    min_beta = float(user_inputs["min_beta"]); max_beta = float(user_inputs["max_beta"])
-    goal = user_inputs["goal"]; horizon_years = int(user_inputs["horizon"])
+# ---------------- Main picker ----------------
+def dynamic_universal_picker(
+    user_inputs: dict,
+    scan_cap_us: int = 250,
+    scan_cap_uk: int = 200,
+    want_equities: int = 50,
+    want_debt: int = 30
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
 
-    bench = _download_index_close("ACWI")
+    min_beta = float(user_inputs["min_beta"])
+    max_beta = float(user_inputs["max_beta"])
+    goal = user_inputs["goal"]
+    horizon_years = int(user_inputs["horizon"])
+
+    bench = _download_index_close()
     if bench is None or bench.empty:
-        raise ValueError("Could not fetch ACWI benchmark.")
+        raise ValueError("Could not fetch a benchmark (ACWI/^GSPC/^FTSE).")
 
+    # Build universe
     all_ticks = universal_equity_universe()
     us_ticks = [t for t in all_ticks if not t.endswith(".L")][:scan_cap_us]
     uk_ticks = [t for t in all_ticks if t.endswith(".L")][:scan_cap_uk]
 
+    # 1) Beta filter + feature calc
     rows = []
     def process(bucket: List[str]):
         for t in bucket:
@@ -352,6 +358,7 @@ def dynamic_universal_picker(user_inputs: dict,
     eq["Score"] = score.fillna(0.0)
     eq = eq.sort_values(["Score","Avg Volume (60d)"], ascending=[False, False]).head(want_equities).reset_index(drop=True)
 
+    # 3) Dynamic Debt ETFs (scrape + validate by liquidity)
     us_debt = _scrape_us_bond_etfs()
     uk_debt = _scrape_uk_bond_etfs()
     debt_list: list[str] = []
@@ -362,7 +369,7 @@ def dynamic_universal_picker(user_inputs: dict,
 
     return eq, debt_df
 
-# ------------------- Step 2: Build & Show ------------------- #
+# ===================== UI: Run Module 2 =====================
 if "user_inputs" in st.session_state:
     st.header("Step 2: Global Universe (US & UK) + Goal/Horizon Scoring")
     with st.spinner("Building US+UK universe, computing betas & goal/horizon scores..."):
