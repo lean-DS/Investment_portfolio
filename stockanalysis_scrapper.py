@@ -30,20 +30,7 @@ _session.headers.update({
 })
 DEFAULT_TIMEOUT = 12
 
-# --------------------------------------------------------------------
-# Helpers
-# --------------------------------------------------------------------
-def _allowed(path: str) -> bool:
-    rp = robotparser.RobotFileParser()
-    rp.set_url(urljoin(BASE, "/robots.txt"))
-    try:
-        rp.read()
-    except Exception:
-        return False
-    # StockAnalysis robots often return False for /sitemap.xml, but content is public.
-    # We'll still check to be polite; if False, caller can decide what to do.
-    return rp.can_fetch(_session.headers.get("User-Agent", "*"), urljoin(BASE, path))
-
+# ----------------- helpers -----------------
 def _get(url: str) -> Optional[requests.Response]:
     try:
         r = _session.get(url, timeout=DEFAULT_TIMEOUT)
@@ -53,19 +40,6 @@ def _get(url: str) -> Optional[requests.Response]:
         pass
     return None
 
-# --------------------------------------------------------------------
-# Sitemaps → US stocks & ETFs (strict symbol filtering)
-# --------------------------------------------------------------------
-# Allow tickers like: A, AA, BRK.B, RDS-A, VOD, VOD.L (we drop .L later if using Stooq)
-_TICKER_RE = re.compile(r"^[A-Za-z][A-Za-z0-9.\-]{0,9}$")
-
-# Common non-ticker slugs that appear under /stocks/ or /etf/ in sitemaps
-_DENY = {
-    "SCREENER","COMPARE","INDUSTRY","EARNINGS-CALENDAR","MARKETS","NEWS",
-    "PROVIDER","ECONOMY","INSIGHTS","LEARN","DIVIDENDS","IPO","LISTS","IDEAS",
-    "ETFS","SECTORS","INDEX","BLOG","ABOUT","CONTACT","JOBS","BROKERS","TOOLS"
-}
-
 def _iter_sitemaps() -> List[str]:
     r = _get(SITEMAP_INDEX)
     if not r:
@@ -73,8 +47,15 @@ def _iter_sitemaps() -> List[str]:
     soup = BeautifulSoup(r.text, "xml")
     return [loc.get_text(strip=True) for loc in soup.find_all("loc")]
 
+# ticker-like slugs only
+_TICKER_RE = re.compile(r"^[A-Za-z][A-Za-z0-9.\-]{0,9}$")
+_DENY = {
+    "SCREENER","COMPARE","INDUSTRY","EARNINGS-CALENDAR","MARKETS","NEWS",
+    "PROVIDER","ECONOMY","INSIGHTS","LEARN","DIVIDENDS","IPO","LISTS","IDEAS",
+    "ETFS","SECTORS","INDEX","BLOG","ABOUT","CONTACT","JOBS","BROKERS","TOOLS"
+}
+
 def _extract_symbols_from_sitemap(sitemap_url: str, max_take: Optional[int]=None) -> List[Tuple[str, str]]:
-    """Return (symbol, kind) where kind in {'stocks','etf'} with strict filtering."""
     r = _get(sitemap_url)
     if not r:
         return []
@@ -86,15 +67,12 @@ def _extract_symbols_from_sitemap(sitemap_url: str, max_take: Optional[int]=None
         if not m:
             continue
         kind, raw = m.group(1), m.group(2).upper()
-
-        # Filter out known non-ticker slugs and force a ticker-like shape
         sym = raw.replace("/", "").upper()
         if sym in _DENY:
             continue
         if not _TICKER_RE.fullmatch(sym):
             continue
-
-        out.append((sym, kind))
+        out.append((sym, kind))  # kind in {'stocks','etf'}
         if max_take and len(out) >= max_take:
             break
     return out
@@ -119,31 +97,28 @@ def fetch_all_symbols_from_sitemaps(types: Iterable[str] = ("stock","etf"),
             break
     return {"stock": stocks[:max_per_type], "etf": etfs[:max_per_type]}
 
-# --------------------------------------------------------------------
-# UK universes (LSE + AIM list pages)
-# --------------------------------------------------------------------
+# ----------------- UK EPIC lists (LSE + AIM) -----------------
 UK_LIST_PAGES = [
     "/list/london-stock-exchange/",
     "/list/london-stock-exchange-aim/",
 ]
 
 def fetch_uk_epics_from_lists(max_pages: int = 2) -> List[str]:
-    """Scrape EPICs from /quote/lon/<EPIC>/ and also scan table cells."""
     epics: set[str] = set()
-    for idx, path in enumerate(UK_LIST_PAGES[:max_pages]):
+    for path in UK_LIST_PAGES[:max_pages]:
         r = _get(urljoin(BASE, path))
         if not r:
             continue
         soup = BeautifulSoup(r.text, "lxml")
 
-        # 1) Preferred: /quote/lon/XXXX/
+        # Prefer /quote/lon/<EPIC>/
         for a in soup.select("a[href]"):
             href = a["href"]
             m = re.search(r"/quote/(?:lon|lse)/([A-Za-z0-9.\-]+)/", href, flags=re.IGNORECASE)
             if m:
                 epics.add(m.group(1).upper())
 
-        # 2) Fallback: 1–5 letters (ignore all-digit codes)
+        # Fallback: 1–5 letters that look like EPICs
         for td in soup.select("td"):
             t = td.get_text(strip=True).upper()
             if re.fullmatch(r"[A-Z]{1,5}(\.[A-Z])?", t):
