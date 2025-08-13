@@ -20,7 +20,7 @@ import streamlit as st
 import yfinance as yf
 from pandas_datareader import data as pdr
 
-from stockanalysis_scraper import (
+from stockanalysis_scrapper import (
     fetch_all_symbols_from_sitemaps,
     fetch_bond_etfs_from_stockanalysis,
 )
