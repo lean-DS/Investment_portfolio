@@ -20,12 +20,15 @@ import pandas as pd
 import numpy as np
 import requests
 
-from stockanalysis_scrapper import (
-    fetch_all_symbols_from_sitemaps,   # US stocks & ETFs
-    fetch_uk_epics_from_lists          # UK EPICs (LSE + AIM)
+from stockanalysis_scraper import (
+    fetch_all_symbols_from_sitemaps,
+    fetch_uk_epics_from_lists
 )
 
-os.environ["ALPHAVANTAGE_API_KEY"] = "QC0N0N5TH9FGZIN6"
+# ─────────────────────────────────────────────────────────
+# Alpha Vantage key: env override, else fallback to hardcoded
+# ─────────────────────────────────────────────────────────
+ALPHA_KEY = os.getenv("ALPHAVANTAGE_API_KEY", "QC0N0N5TH9FGZIN6").strip()
 
 # ------------------- Page Setup ------------------- #
 st.set_page_config(page_title="Dynamic Portfolio Recommender", layout="wide")
@@ -42,8 +45,6 @@ SESSION.headers.update({
     "Accept-Language": "en-US,en;q=0.9",
 })
 TIMEOUT = 12
-
-ALPHA_KEY = os.getenv("ALPHAVANTAGE_API_KEY", "QC0N0N5TH9FGZIN6").strip()
 
 CACHE_DIR = Path("data_cache")
 CACHE_DIR.mkdir(exist_ok=True)
@@ -89,7 +90,6 @@ def stooq_csv(symbol: str, interval="d") -> Optional[pd.DataFrame]:
             return None
         df["Date"] = pd.to_datetime(df["Date"])
         df = df.sort_values("Date").reset_index(drop=True)
-        # ensure columns
         for c in ["Open","High","Low","Close","Volume"]:
             if c not in df.columns:
                 df[c] = np.nan
@@ -121,15 +121,10 @@ def alpha_daily(symbol: str) -> Optional[pd.DataFrame]:
         return None
 
 def fetch_ohlcv_any(sym: str, min_rows: int = 500) -> Optional[pd.DataFrame]:
-    """
-    Unified loader with cache: Cache → Stooq (US) → Stooq (.L) → Alpha Vantage.
-    Ensures we can cover 1–2+ years for model features.
-    """
     cached = load_cache(sym)
     if cached is not None and len(cached) >= min_rows:
         return cached
 
-    # Stooq US guess
     stq = to_stooq_symbol(sym)
     if stq:
         df = stooq_csv(stq)
@@ -137,7 +132,6 @@ def fetch_ohlcv_any(sym: str, min_rows: int = 500) -> Optional[pd.DataFrame]:
             save_cache(sym, df)
             return df
 
-    # Stooq LSE form
     stq2 = to_stooq_symbol(sym + ".L")
     if stq2:
         df2 = stooq_csv(stq2)
@@ -145,7 +139,6 @@ def fetch_ohlcv_any(sym: str, min_rows: int = 500) -> Optional[pd.DataFrame]:
             save_cache(sym, df2)
             return df2
 
-    # Alpha fallback (respect rate limits in batch jobs; here per-symbol)
     df3 = alpha_daily(sym)
     if df3 is not None and len(df3) >= min_rows:
         save_cache(sym, df3)
@@ -157,8 +150,22 @@ def stooq_has_history(sym: str, min_rows: int = 500) -> bool:
     df = fetch_ohlcv_any(sym, min_rows=min_rows)
     return df is not None
 
+# =========================
+# Benchmark chooser (FIX)
+# =========================
+def choose_benchmark() -> Optional[pd.DataFrame]:
+    """
+    Try a few Stooq benchmarks and return the first valid one.
+    Avoids 'DataFrame truth value is ambiguous' by not using `or` on DataFrames.
+    """
+    for sym in ["^spx", "acwi.us", "^ftse"]:
+        df = stooq_csv(sym)
+        if df is not None and not df.empty and "Close" in df.columns:
+            return df
+    return None
+
 # =========================================================
-# Universe loaders (CSV → live scrape fallback → Stooq validation)
+# Universe loaders (CSV → scrape fallback → Stooq validation)
 # =========================================================
 def load_universe_csv(filename: str) -> List[str]:
     try:
@@ -172,9 +179,8 @@ def load_universe_csv(filename: str) -> List[str]:
     return []
 
 def get_equity_universe(max_us: int = 2000, max_uk: int = 2000) -> List[str]:
-    # Prefer CSV (you can pre-populate from reliable lists)
     us = []
-    us += load_universe_csv("equities_us_sp500.csv")  # optional
+    us += load_universe_csv("equities_us_sp500.csv")
     if not us:
         try:
             sa = fetch_all_symbols_from_sitemaps(types=("stock",), max_per_type=max_us, max_sitemaps=10)
@@ -193,21 +199,15 @@ def get_equity_universe(max_us: int = 2000, max_uk: int = 2000) -> List[str]:
 
     merged = list(dict.fromkeys(us + uk))[: (max_us + max_uk)]
 
-    # Validate via Stooq/AV (ensure 1–2y history)
     valid = []
     for s in merged:
-        if stooq_has_history(s, min_rows=500):  # ~2y of dailies
+        if stooq_has_history(s, min_rows=500):
             valid.append(s)
         if len(valid) % 50 == 0:
             time.sleep(0.15)
     return valid
 
 def get_etf_universe(max_n: int = 4000) -> pd.DataFrame:
-    """
-    Return DataFrame with at least Ticker, Name (optional).
-    Prefers CSV 'etfs_master.csv' (columns: Ticker, Name?) then sitemap scrape.
-    """
-    # CSV first
     if Path("etfs_master.csv").exists():
         try:
             df = pd.read_csv("etfs_master.csv")
@@ -216,8 +216,6 @@ def get_etf_universe(max_n: int = 4000) -> pd.DataFrame:
                 return df.drop_duplicates("Ticker").head(max_n).reset_index(drop=True)
         except Exception:
             pass
-
-    # Fallback: sitemap ETFS (tickers only)
     try:
         sa = fetch_all_symbols_from_sitemaps(types=("etf",), max_per_type=max_n, max_sitemaps=10)
         etfs = sa.get("etf", [])
@@ -226,7 +224,7 @@ def get_etf_universe(max_n: int = 4000) -> pd.DataFrame:
         return pd.DataFrame({"Ticker": []})
 
 # =========================================================
-# Investor inputs (risk, goal, horizon) + beta window
+# Investor inputs
 # =========================================================
 c1, c2, c3, c4 = st.columns(4)
 with c1:
@@ -260,7 +258,7 @@ min_beta, max_beta = beta_window(risk_profile)
 st.info(f"Target Equity Beta Window: **{min_beta} – {max_beta}**")
 
 # =========================================================
-# Features, scoring, and risk alignment
+# Features & Scoring
 # =========================================================
 def total_return(close: pd.Series, days: int) -> float:
     if len(close) <= days: return np.nan
@@ -313,7 +311,7 @@ def apply_risk_constraints_to_equities(df: pd.DataFrame, risk: str) -> pd.DataFr
         out["Score"] = out["Score"] + mom_boost
     return out.sort_values("Score", ascending=False)
 
-# ---- ETF categorization and profile scoring ----
+# ETF scoring (same as before)
 def etf_category_from_name(ticker: str, name: str = "") -> str:
     t = f"{ticker} {name}".lower()
     if any(k in t for k in ["ultra short","ultrashort","very short","t-bill","t bill","0-3","0-1","1-3",
@@ -360,7 +358,7 @@ def etf_preference_weights(risk: str, goal: str, horizon_years: int) -> dict:
 def score_etfs_by_profile(etf_df: pd.DataFrame, risk: str, goal: str, horizon_years: int) -> pd.DataFrame:
     prefs = etf_preference_weights(risk, goal, horizon_years)
     vols, cats = [], []
-    for i, row in etf_df.iterrows():
+    for _, row in etf_df.iterrows():
         t = row["Ticker"]
         nm = row.get("Name", "")
         df = fetch_ohlcv_any(t, min_rows=300)
@@ -380,17 +378,15 @@ def score_etfs_by_profile(etf_df: pd.DataFrame, risk: str, goal: str, horizon_ye
 def select_bond_etfs(etf_pool: pd.DataFrame, risk: str, goal: str, horizon_years: int,
                      want: int = 20) -> pd.DataFrame:
     ranked = score_etfs_by_profile(etf_pool, risk, goal, horizon_years)
-    if len(ranked) >= want:
-        return ranked.head(want).reset_index(drop=True)
     return ranked.head(want).reset_index(drop=True)
 
 # =========================================================
-# Button: Build universe, compute scores, display
+# Build button
 # =========================================================
 if st.button("Build Dynamic Universe", type="primary"):
     with st.spinner("Fetching benchmark..."):
-        bench = stooq_csv("^spx") or stooq_csv("acwi.us")
-        if bench is None or bench.empty:
+        bench = choose_benchmark()
+        if bench is None or bench.empty or "Close" not in bench.columns:
             st.error("Could not fetch a benchmark from Stooq.")
             st.stop()
         bench_close = bench["Close"].dropna()
@@ -403,7 +399,6 @@ if st.button("Build Dynamic Universe", type="primary"):
             st.stop()
 
         rows = []
-        # Scan a bounded number for speed; increase if your runtime allows
         scan_cap = min(800, len(syms))
         for sym in syms[:scan_cap]:
             df = fetch_ohlcv_any(sym, min_rows=500)
@@ -413,7 +408,6 @@ if st.button("Build Dynamic Universe", type="primary"):
             beta = calc_beta(close, bench_close)
             if beta is None:
                 continue
-            # beta gate (auto-widen if too strict handled later)
             if not (min_beta <= beta <= max_beta):
                 continue
 
@@ -422,7 +416,6 @@ if st.button("Build Dynamic Universe", type="primary"):
             mom12 = total_return(close, 252)
             vol   = volatility(close.pct_change().dropna())
             mdd   = max_drawdown(close)
-            # yield proxy -> set 0.0 here (plug fundamentals later if needed)
             dy = 0.0
             avgv = float(df["Volume"].tail(60).mean()) if "Volume" in df.columns else 0.0
             rows.append((sym, beta, avgv, mom3, mom6, mom12, vol, mdd, dy))
@@ -430,10 +423,9 @@ if st.button("Build Dynamic Universe", type="primary"):
         cols = ["Ticker","Beta","Avg Volume (60d)","3M Return","6M Return","12M Return","Volatility","Max Drawdown","Dividend Yield"]
         eq = pd.DataFrame(rows, columns=cols) if rows else pd.DataFrame(columns=cols)
 
-        # If too few passed, widen beta once, then drop gate
+        # widen beta once if needed
         want_equities = 50
         if eq.empty or len(eq) < want_equities:
-            # widen by 0.3
             widened_rows = []
             for sym in syms[:scan_cap]:
                 df = fetch_ohlcv_any(sym, min_rows=500)
@@ -455,7 +447,6 @@ if st.button("Build Dynamic Universe", type="primary"):
                 eq = pd.DataFrame(widened_rows, columns=cols)
 
         if eq.empty:
-            # final fallback: rank by score without beta gate
             fb_rows = []
             for sym in syms[:scan_cap]:
                 df = fetch_ohlcv_any(sym, min_rows=500)
@@ -472,7 +463,6 @@ if st.button("Build Dynamic Universe", type="primary"):
                 fb_rows.append((sym, np.nan, avgv, mom3, mom6, mom12, vol, mdd, dy))
             eq = pd.DataFrame(fb_rows, columns=cols) if fb_rows else pd.DataFrame(columns=cols)
 
-        # equity scoring
         w = equity_weights(goal, horizon)
         score = (
             normalize(eq["3M Return"])   * w.get("mom3",0) +
@@ -490,15 +480,14 @@ if st.button("Build Dynamic Universe", type="primary"):
     st.dataframe(top_equities, use_container_width=True)
 
     # ---------- ETFs ----------
-    with st.spinner("Building ETF pool, matching risk × goal × horizon, and guaranteeing ≥ 20..."):
+    with st.spinner("Building ETF pool, matching risk × goal × horizon..."):
         etf_pool = get_etf_universe()
-        # optional: filter to bond/fixed-income ETFs only by name/ticker keywords
-        # Here we keep all ETFs and let the category scorer decide.
         want_etfs = 20
         top_etfs = select_bond_etfs(etf_pool, risk_profile, goal, horizon, want=want_etfs)
 
     st.subheader("Recommended ETFs (bond sleeve; risk & goal aligned)")
-    st.dataframe(top_etfs[["Ticker","Category","Vol60","Score"]], use_container_width=True)
+    show_cols = [c for c in ["Ticker","Category","Vol60","Score"] if c in top_etfs.columns]
+    st.dataframe(top_etfs[show_cols], use_container_width=True)
 
 # =========================================================
 # Diagnostics
