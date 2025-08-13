@@ -8,61 +8,350 @@ Original file is located at
 """
 
 # app.py
-import streamlit as st
-import pandas as pd
-import numpy as np
-import yfinance as yf
+# app.py
+import os
 import time
+from typing import List, Tuple
 
-# ---- Helper: Safe Yahoo Finance Fetch ----
-def safe_fetch(tickers, start, end, retries=3, delay=2):
-    for attempt in range(retries):
-        try:
-            data = yf.download(tickers, start=start, end=end, progress=False)
-            if not data.empty:
-                return data
-        except Exception as e:
-            st.error(f"Fetch attempt {attempt+1} failed: {e}")
-        time.sleep(delay)
-    return pd.DataFrame()  # Return empty if failed
+import numpy as np
+import pandas as pd
+import requests
+import streamlit as st
+import yfinance as yf
+from pandas_datareader import data as pdr
 
-# ---- Streamlit App ----
+from stockanalysis_scraper import (
+    fetch_all_symbols_from_sitemaps,
+    fetch_bond_etfs_from_stockanalysis,
+)
+
+# ================= Streamlit UI =================
+st.set_page_config(page_title="Dynamic Portfolio Recommender", layout="wide")
 st.title("Dynamic Portfolio Recommender")
 
-# Example Input Section
-risk_profile = st.selectbox("Select Risk Profile", ["Low", "Medium", "High"])
-start_date = "2020-01-01"
-end_date = "2023-12-31"
+# ---------- Investor inputs ----------
+c1, c2, c3 = st.columns(3)
+with c1:
+    risk_profile = st.selectbox("Select Risk Profile", ["Low", "Medium", "High"], index=1)
+with c2:
+    horizon = st.slider("Investment Horizon (years)", 1, 10, 3)
+with c3:
+    goal = st.selectbox("Investment Goal", ["Capital Growth", "Dividend Income", "Balanced"], index=2)
+
+amount = st.number_input("Investment Amount (£)", min_value=1000, step=1000, value=10000)
+
+# Map risk → beta ranges
+def assign_beta_range(profile: str) -> Tuple[float, float]:
+    if profile == "Low":    return (0.5, 1.0)
+    if profile == "Medium": return (1.1, 1.3)
+    return (1.4, 2.2)
+
+min_beta, max_beta = assign_beta_range(risk_profile)
+
+st.info(f"Target Beta: **{min_beta} – {max_beta}**")
 
 if st.button("Build Dynamic Universe"):
-    with st.spinner("Fetching market data..."):
-        benchmark_tickers = ["ACWI", "^GSPC", "^FTSE"]
-        benchmark_data = safe_fetch(benchmark_tickers, start_date, end_date)
+    st.session_state.user_inputs = dict(
+        risk_profile=risk_profile,
+        min_beta=min_beta,
+        max_beta=max_beta,
+        horizon=horizon,
+        goal=goal,
+        amount=amount,
+    )
+    st.rerun()
 
-    if benchmark_data.empty:
-        st.error("Universe build failed: Could not fetch benchmark data. Possible reasons: "
-                 "Yahoo Finance restriction, network issue, or invalid ticker.")
+# -------------- HTTP session shared --------------
+_session = requests.Session()
+_session.headers.update({"User-Agent": "Mozilla/5.0"})
+
+# -------------- Data fetch fallbacks --------------
+def _to_stooq_symbol(yahoo_sym: str) -> str | None:
+    s = yahoo_sym.strip().upper()
+    if s in {"^GSPC", "^SPX"}: return "^spx"
+    if s in {"^FTSE"}:         return "^ftse"
+    if s.endswith(".L"):       return f"{s[:-2].lower()}.uk"
+    if s.isalpha() or "-" in s:
+        return f"{s.lower()}.us"
+    return None
+
+def _alpha_vantage_close_series(symbol: str) -> pd.Series | None:
+    key = os.getenv("ALPHAVANTAGE_KEY")
+    if not key:
+        return None
+    try:
+        url = "https://www.alphavantage.co/query"
+        params = {"function":"TIME_SERIES_DAILY_ADJUSTED","symbol":symbol,"outputsize":"full","apikey":key}
+        r = _session.get(url, params=params, timeout=15)
+        j = r.json()
+        ts = j.get("Time Series (Daily)")
+        if not ts:
+            return None
+        df = pd.DataFrame(ts).T.sort_index()
+        df.index = pd.to_datetime(df.index)
+        close = pd.to_numeric(df["4. close"], errors="coerce").dropna()
+        return close
+    except Exception:
+        return None
+
+def _download_ohlcv(ticker: str) -> pd.DataFrame | None:
+    # 1) Stooq
+    try:
+        stq = _to_stooq_symbol(ticker)
+        if stq:
+            df = pdr.DataReader(stq, "stooq")
+            if df is not None and not df.empty:
+                df = df.sort_index()
+                if "Close" not in df.columns and "close" in df.columns:
+                    df.rename(columns={"open":"Open","high":"High","low":"Low",
+                                       "close":"Close","volume":"Volume"}, inplace=True)
+                return df
+    except Exception:
+        pass
+    # 2) Alpha Vantage
+    try:
+        close = _alpha_vantage_close_series(ticker)
+        if close is not None and not close.empty:
+            return pd.DataFrame({"Close": close})
+    except Exception:
+        pass
+    # 3) yfinance
+    try:
+        df = yf.download(ticker, period="2y", interval="1d",
+                         progress=False, auto_adjust=False, threads=False, session=_session)
+        if df is not None and not df.empty:
+            return df
+    except Exception:
+        pass
+    return None
+
+def _download_index_close(symbols=("ACWI", "SPY", "^GSPC", "VEU", "^FTSE")) -> pd.Series | None:
+    for sym in symbols:
+        # Stooq
+        try:
+            stq = _to_stooq_symbol(sym)
+            if stq:
+                df = pdr.DataReader(stq, "stooq")
+                if df is not None and not df.empty:
+                    df = df.sort_index()
+                    ser = (df["Close"] if "Close" in df.columns else df.iloc[:,0]).dropna()
+                    if not ser.empty:
+                        return ser
+        except Exception:
+            pass
+        # Alpha Vantage
+        try:
+            ser = _alpha_vantage_close_series(sym)
+            if ser is not None and not ser.empty:
+                return ser
+        except Exception:
+            pass
+        # yfinance
+        try:
+            df = yf.download(sym, period="2y", interval="1d",
+                             progress=False, threads=False, session=_session)
+            if df is not None and not df.empty and "Close" in df.columns:
+                ser = df["Close"].dropna()
+                if not ser.empty:
+                    return ser
+        except Exception:
+            pass
+    return None
+
+# -------------- Feature & score --------------
+def _total_return(close: pd.Series, days: int) -> float:
+    if len(close) < days + 1: return np.nan
+    return float(close.iloc[-1] / close.iloc[-1 - days] - 1.0)
+
+def _max_drawdown(close: pd.Series) -> float:
+    roll_max = close.cummax()
+    dd = (close / roll_max - 1.0)
+    return float(dd.min())
+
+def _volatility(daily_ret: pd.Series) -> float:
+    return float(daily_ret.std())
+
+def _ttm_dividend_yield(ticker: str, price_now: float) -> float:
+    try:
+        t = yf.Ticker(ticker, session=_session)
+        div = t.dividends
+        if div is None or div.empty or price_now <= 0: return 0.0
+        recent = div[div.index >= (div.index.max() - pd.Timedelta(days=365))]
+        total = float(recent.sum()) if not recent.empty else 0.0
+        return float(total / price_now)
+    except Exception:
+        return 0.0
+
+def _normalize(s: pd.Series, invert: bool=False) -> pd.Series:
+    s = s.replace([np.inf, -np.inf], np.nan)
+    s = s.fillna(s.median()) if not s.isna().all() else s.fillna(0.0)
+    lo, hi = s.min(), s.max()
+    if hi == lo: out = pd.Series(0.5, index=s.index)
+    else:        out = (s - lo) / (hi - lo)
+    return 1 - out if invert else out
+
+def _equity_weights(goal: str, horizon_years: int) -> dict:
+    short = horizon_years < 3
+    if goal == "Capital Growth":
+        return {"mom3":0.40 if short else 0.25, "mom6":0.25, "mom12":0.15 if short else 0.30,
+                "vol":0.10, "dd":0.10, "yield":0.10 if not short else 0.00}
+    if goal == "Dividend Income":
+        return {"yield":0.55 if not short else 0.45, "vol":0.15, "dd":0.15, "mom3":0.05, "mom6":0.05, "mom12":0.05}
+    return {"mom3":0.20 if short else 0.15, "mom6":0.20, "mom12":0.20,
+            "vol":0.15, "dd":0.15, "yield":0.10 if not short else 0.05}
+
+# -------------- Core selection using Stock Analysis universes --------------
+def dynamic_universal_picker(
+    user_inputs: dict,
+    scan_cap_stock: int = 400,    # how many StockAnalysis 'stock' tickers to examine
+    want_equities: int = 50,
+    want_debt: int = 30,
+    bond_probe: int = 600         # how many ETF pages to check titles for bond ETFs
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
+
+    min_beta = float(user_inputs["min_beta"])
+    max_beta = float(user_inputs["max_beta"])
+    goal = user_inputs["goal"]
+    horizon_years = int(user_inputs["horizon"])
+
+    bench = _download_index_close()
+    if bench is None or bench.empty:
+        raise ValueError("Could not fetch benchmark data. Possible reasons: Yahoo Finance restriction, network issue, or invalid ticker.")
+
+    # ---- 1) Build equities universe from StockAnalysis (stocks only) ----
+    sa = fetch_all_symbols_from_sitemaps(types=("stock", "etf"), max_per_type=5000)
+    stock_universe = sa["stock"][:scan_cap_stock]
+
+    rows = []
+    for t in stock_universe:
+        df = _download_ohlcv(t)
+        if df is None or len(df) < 50 or "Close" not in df.columns:
+            continue
+        close = df["Close"].dropna()
+        beta = _calculate_beta_vs(close, bench)
+        if beta is None or not (min_beta <= beta <= max_beta):
+            continue
+        avg_vol = float(df["Volume"].dropna().tail(60).mean()) if "Volume" in df.columns else 0.0
+        mom3 = _total_return(close, 63)
+        mom6 = _total_return(close, 126)
+        mom12 = _total_return(close, 252)
+        vol = _volatility(close.pct_change().dropna())
+        mdd = _max_drawdown(close)
+        dy = _ttm_dividend_yield(t, float(close.iloc[-1]))
+        rows.append((t, beta, avg_vol, mom3, mom6, mom12, vol, mdd, dy))
+
+    if not rows:
+        equities = pd.DataFrame(columns=["Ticker","Beta","Score"])
     else:
-        st.success("Benchmark data fetched successfully!")
-        st.dataframe(benchmark_data.head())  # Debug view
+        equities = pd.DataFrame(rows, columns=[
+            "Ticker","Beta","Avg Volume (60d)","3M Return","6M Return","12M Return","Volatility","Max Drawdown","Dividend Yield"
+        ])
+        for col in ["Avg Volume (60d)","3M Return","6M Return","12M Return","Volatility","Max Drawdown","Dividend Yield","Beta"]:
+            equities[col] = pd.to_numeric(equities[col], errors="coerce")
 
-        # ---- Your Existing Logic for Universe Build ----
-        # Candidate equities filtering example:
-        equities = ["AAPL", "MSFT", "GOOGL", "AMZN"]
-        equities_data = safe_fetch(equities, start_date, end_date)
+        w = _equity_weights(goal, horizon_years)
+        score = (
+            _normalize(equities["3M Return"])   * w.get("mom3",0) +
+            _normalize(equities["6M Return"])   * w.get("mom6",0) +
+            _normalize(equities["12M Return"])  * w.get("mom12",0) +
+            _normalize(equities["Volatility"], invert=True) * w.get("vol",0) +
+            _normalize(equities["Max Drawdown"], invert=True) * w.get("dd",0) +
+            _normalize(equities["Dividend Yield"]) * w.get("yield",0)
+        )
+        equities["Score"] = score.fillna(0.0)
+        equities = equities.sort_values(["Score","Avg Volume (60d)"], ascending=[False, False]).head(want_equities).reset_index(drop=True)
 
-        if equities_data.empty:
-            st.warning("No equities matched your beta range. Try a different risk profile.")
-        else:
-            st.write("Candidate Equities Found:")
-            st.dataframe(equities_data.head())
+    # ---- 2) Debt ETFs from StockAnalysis (title filter) ----
+    bond_etfs = fetch_bond_etfs_from_stockanalysis(max_check=bond_probe, parallel=6)
 
-        # ---- Debt ETFs Example ----
-        debt_etfs = ["BND", "AGG"]
-        debt_data = safe_fetch(debt_etfs, start_date, end_date)
+    def _validate_rank_debt(tickers: List[str], want: int) -> pd.DataFrame:
+        rows = []
+        for t in tickers:
+            df = _download_ohlcv(t)
+            if df is None or df.empty: 
+                continue
+            vol = float(df["Volume"].dropna().tail(60).mean()) if "Volume" in df.columns else 0.0
+            rows.append((t, vol))
+        if not rows:
+            return pd.DataFrame(columns=["Ticker","Avg Volume (60d)"])
+        out = (pd.DataFrame(rows, columns=["Ticker","Avg Volume (60d)"])
+                .sort_values("Avg Volume (60d)", ascending=False)
+                .drop_duplicates("Ticker")
+                .head(want)
+                .reset_index(drop=True))
+        return out
 
-        if debt_data.empty:
-            st.warning("No bond ETFs found this run. Try again later.")
-        else:
-            st.write("Debt ETFs Found:")
-            st.dataframe(debt_data.head())
+    debt_df = _validate_rank_debt(bond_etfs, want_debt)
+
+    return equities, debt_df
+
+def _calculate_beta_vs(close_stock: pd.Series, close_bench: pd.Series) -> float | None:
+    sret = close_stock.pct_change().dropna()
+    bret = close_bench.pct_change().dropna()
+    aligned = pd.concat([sret, bret], axis=1, join="inner").dropna()
+    if len(aligned) < 30: return None
+    aligned.columns = ["stock","bench"]
+    bvar = aligned["bench"].var()
+    if not bvar or pd.isna(bvar): return None
+    beta = aligned.cov().iloc[0,1] / bvar
+    return round(float(beta), 2)
+
+# -------------- Diagnostics --------------
+@st.cache_data(ttl=300)
+def probe_connectivity():
+    out = {}
+    try:
+        r = _session.get("https://www.google.com", timeout=8)
+        out["google_ok"] = (r.status_code, len(r.text))
+    except Exception as e:
+        out["google_ok"] = f"ERR: {e}"
+    try:
+        r = _session.get("https://query2.finance.yahoo.com/v10/finance/quoteSummary/ACWI?modules=price", timeout=10)
+        out["yahoo_json"] = (r.status_code, r.headers.get("content-type", ""))
+        out["yahoo_json_snip"] = r.text[:120]
+    except Exception as e:
+        out["yahoo_json"] = f"ERR: {e}"
+    try:
+        df = yf.download("ACWI", period="5d", interval="1d", progress=False, threads=False, session=_session)
+        out["yfinance_shape"] = None if df is None else df.shape
+        out["yfinance_empty"] = (df is None) or df.empty
+    except Exception as e:
+        out["yfinance_error"] = f"ERR: {e}"
+    try:
+        xml = _session.get("https://stockanalysis.com/sitemap.xml", timeout=10)
+        out["stockanalysis_sitemap"] = xml.status_code
+    except Exception as e:
+        out["stockanalysis_sitemap"] = f"ERR: {e}"
+    return out
+
+with st.expander("🔧 Diagnostics"):
+    if st.button("Run connectivity tests"):
+        st.write(probe_connectivity())
+
+# -------------- Run picker --------------
+if "user_inputs" in st.session_state:
+    st.header("Step 2: Global Universe (from StockAnalysis) + Goal/Horizon Scoring")
+    with st.spinner("Building universe, computing betas & scores..."):
+        try:
+            equities_df, debt_df = dynamic_universal_picker(
+                st.session_state["user_inputs"],
+                scan_cap_stock=400,   # adjust based on runtime budget
+                want_equities=50,
+                want_debt=30,
+                bond_probe=600
+            )
+        except Exception as e:
+            st.error(f"Universe build failed: {e}")
+            equities_df, debt_df = pd.DataFrame(), pd.DataFrame()
+
+    st.subheader("Candidate Equities")
+    if equities_df.empty:
+        st.warning("No equities matched the beta range. Try a different risk profile.")
+    else:
+        st.dataframe(equities_df, use_container_width=True)
+
+    st.subheader("Debt ETFs (ranked by liquidity)")
+    if debt_df.empty:
+        st.warning("No bond ETFs found this run. Try again later.")
+    else:
+        st.dataframe(debt_df, use_container_width=True)
