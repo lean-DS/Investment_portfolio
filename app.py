@@ -8,8 +8,7 @@ Original file is located at
 """
 
 # app.py
-# app.py
-# --- Dynamic Portfolio Recommender (StockAnalysis + Stooq only; no Yahoo) ---
+# Dynamic Portfolio Recommender (StockAnalysis universes + Stooq CSV prices; optional Alpha Vantage)
 
 import io
 import os
@@ -26,11 +25,10 @@ from stockanalysis_scrapper import (
     fetch_bond_etfs_from_stockanalysis,
 )
 
-# ================= Streamlit UI =================
+# ---------- Streamlit UI ----------
 st.set_page_config(page_title="Dynamic Portfolio Recommender", layout="wide")
 st.title("Dynamic Portfolio Recommender")
 
-# ---------- Investor inputs ----------
 c1, c2, c3 = st.columns(3)
 with c1:
     risk_profile = st.selectbox("Select Risk Profile", ["Low", "Medium", "High"], index=1)
@@ -41,6 +39,7 @@ with c3:
 
 amount = st.number_input("Investment Amount (£)", min_value=1000, step=1000, value=10000)
 
+# ---------- Risk → beta window ----------
 def assign_beta_range(profile: str) -> Tuple[float, float]:
     if profile == "Low":    return (0.5, 1.0)
     if profile == "Medium": return (1.1, 1.3)
@@ -60,32 +59,25 @@ if st.button("Build Dynamic Universe"):
     )
     st.rerun()
 
-# -------------- HTTP session shared --------------
+# ---------- Shared HTTP session ----------
 _session = requests.Session()
 _session.headers.update({"User-Agent": "Mozilla/5.0"})
 
-# -------------- Symbol mapping for Stooq --------------
+# ---------- Symbol mapping for Stooq ----------
 def _to_stooq_symbol(yahoo_sym: str) -> str | None:
-    """
-    Map common Yahoo/US/LSE tickers to Stooq's scheme.
-    Examples: AAPL->aapl.us, VOD.L->vod.uk, ^GSPC->^spx, ^FTSE->^ftse
-    """
     s = yahoo_sym.strip().upper()
     # Indices
     if s in {"^GSPC", "^SPX"}: return "^spx"
     if s in {"^FTSE"}:         return "^ftse"
-    # London
+    # London (LSE)
     if s.endswith(".L"):       return f"{s[:-2].lower()}.uk"
     # US/common
     if s.isalpha() or "-" in s:
         return f"{s.lower()}.us"
     return None
 
-# -------------- Data fetch (Stooq CSV + optional Alpha Vantage) --------------
+# ---------- Data fetch: Stooq CSV + optional Alpha Vantage ----------
 def _stooq_download_ohlcv(yahoo_symbol: str) -> pd.DataFrame | None:
-    """
-    Download daily OHLCV from Stooq CSV (no pandas-datareader, no Yahoo).
-    """
     stq = _to_stooq_symbol(yahoo_symbol)
     if not stq:
         return None
@@ -97,7 +89,6 @@ def _stooq_download_ohlcv(yahoo_symbol: str) -> pd.DataFrame | None:
         df = pd.read_csv(io.StringIO(r.text))
         if df.empty or "Date" not in df.columns:
             return None
-        # Normalize columns to match pipeline
         rename = {c: c.capitalize() for c in ["open","high","low","close","volume"] if c in df.columns}
         df.rename(columns=rename, inplace=True)
         df["Date"] = pd.to_datetime(df["Date"])
@@ -110,9 +101,6 @@ def _stooq_download_ohlcv(yahoo_symbol: str) -> pd.DataFrame | None:
         return None
 
 def _alpha_vantage_close_series(symbol: str) -> pd.Series | None:
-    """
-    Optional fallback if Stooq lacks a symbol. Requires env var ALPHAVANTAGE_KEY.
-    """
     key = os.getenv("ALPHAVANTAGE_KEY")
     if not key:
         return None
@@ -132,42 +120,29 @@ def _alpha_vantage_close_series(symbol: str) -> pd.Series | None:
         return None
 
 def _download_ohlcv(ticker: str) -> pd.DataFrame | None:
-    """
-    Try Stooq CSV (preferred) → Alpha Vantage (close-only). No Yahoo fallback.
-    """
     # 1) Stooq CSV
     df = _stooq_download_ohlcv(ticker)
     if df is not None and not df.empty:
         return df
-
-    # 2) Alpha Vantage (close only)
-    try:
-        close = _alpha_vantage_close_series(ticker)
-        if close is not None and not close.empty:
-            return pd.DataFrame({"Close": close})
-    except Exception:
-        pass
-
+    # 2) Alpha Vantage close-only
+    close = _alpha_vantage_close_series(ticker)
+    if close is not None and not close.empty:
+        return pd.DataFrame({"Close": close})
     return None
 
 def _download_index_close(symbols=("ACWI","SPY","^GSPC","VEU","^FTSE")) -> pd.Series | None:
-    """
-    Get a benchmark close series using Stooq CSV → Alpha Vantage. (No Yahoo)
-    """
     for sym in symbols:
         df = _stooq_download_ohlcv(sym)
         if df is not None and not df.empty and "Close" in df.columns:
             ser = df["Close"].dropna()
             if not ser.empty:
                 return ser
-
         ser = _alpha_vantage_close_series(sym)
         if ser is not None and not ser.empty:
             return ser
-
     return None
 
-# -------------- Features & scoring --------------
+# ---------- Feature & scoring ----------
 def _total_return(close: pd.Series, days: int) -> float:
     if len(close) < days + 1: return np.nan
     return float(close.iloc[-1] / close.iloc[-1 - days] - 1.0)
@@ -183,7 +158,7 @@ def _volatility(daily_ret: pd.Series) -> float:
 def _ttm_dividend_yield(ticker: str, price_now: float) -> float:
     """
     TTM dividend yield via Alpha Vantage Monthly Adjusted ('7. dividend amount').
-    Returns 0.0 if no key or no data. Stooq doesn't provide dividends.
+    Returns 0.0 if no key or data (Stooq doesn't provide dividends).
     """
     try:
         if price_now <= 0:
@@ -238,13 +213,18 @@ def _calculate_beta_vs(close_stock: pd.Series, close_bench: pd.Series) -> float 
     beta = aligned.cov().iloc[0,1] / bvar
     return round(float(beta), 2)
 
-# -------------- Core selection using StockAnalysis universes --------------
+# ---------- Core selection ----------
+FALLBACK_BOND_ETFS = [
+    # Very liquid US bond ETFs (Stooq tickers: lower + .us)
+    "AGG", "BND", "LQD", "HYG", "IEF", "TLT", "SHY", "TIP", "BNDX", "EMB", "VGSH", "VGIT", "VGTL", "MUB"
+]
+
 def dynamic_universal_picker(
     user_inputs: dict,
-    scan_cap_stock: int = 400,    # how many StockAnalysis stock tickers to examine
+    scan_cap_stock: int = 400,   # number of stocks to inspect
     want_equities: int = 50,
     want_debt: int = 30,
-    bond_probe: int = 600         # how many ETF pages to check titles for bond ETFs
+    bond_probe: int = 800        # ETF pages to title-check
 ) -> Tuple[pd.DataFrame, pd.DataFrame]:
 
     min_beta = float(user_inputs["min_beta"])
@@ -256,51 +236,65 @@ def dynamic_universal_picker(
     if bench is None or bench.empty:
         raise ValueError("Could not fetch benchmark data (Stooq/Alpha Vantage).")
 
-    # ---- 1) Build equities universe from StockAnalysis (stocks only) ----
+    # 1) Universe from StockAnalysis sitemaps (stocks)
     sa = fetch_all_symbols_from_sitemaps(types=("stock", "etf"), max_per_type=5000)
     stock_universe = sa["stock"][:scan_cap_stock]
 
+    # 2) Compute features; apply beta window; add resiliency
     rows = []
     for t in stock_universe:
         df = _download_ohlcv(t)
-        if df is None or len(df) < 50 or "Close" not in df.columns:
+        if df is None or len(df) < 60 or "Close" not in df.columns:
             continue
         close = df["Close"].dropna()
         beta = _calculate_beta_vs(close, bench)
-        if beta is None or not (min_beta <= beta <= max_beta):
-            continue
         avg_vol = float(df["Volume"].dropna().tail(60).mean()) if "Volume" in df.columns else 0.0
         mom3 = _total_return(close, 63)
         mom6 = _total_return(close, 126)
         mom12 = _total_return(close, 252)
         vol = _volatility(close.pct_change().dropna())
         mdd = _max_drawdown(close)
-        dy = _ttm_dividend_yield(t, float(close.iloc[-1])) if "Close" in df.columns else 0.0
+        dy = _ttm_dividend_yield(t, float(close.iloc[-1]))
         rows.append((t, beta, avg_vol, mom3, mom6, mom12, vol, mdd, dy))
 
-    if not rows:
-        equities = pd.DataFrame(columns=["Ticker","Beta","Score"])
-    else:
-        equities = pd.DataFrame(rows, columns=[
-            "Ticker","Beta","Avg Volume (60d)","3M Return","6M Return","12M Return","Volatility","Max Drawdown","Dividend Yield"
-        ])
-        for col in ["Avg Volume (60d)","3M Return","6M Return","12M Return","Volatility","Max Drawdown","Dividend Yield","Beta"]:
-            equities[col] = pd.to_numeric(equities[col], errors="coerce")
+    cols = ["Ticker","Beta","Avg Volume (60d)","3M Return","6M Return","12M Return","Volatility","Max Drawdown","Dividend Yield"]
+    eq = pd.DataFrame(rows, columns=cols) if rows else pd.DataFrame(columns=cols)
+    for c in cols[1:]:
+        eq[c] = pd.to_numeric(eq[c], errors="coerce")
 
+    # Filter by beta window; widen if needed; finally drop beta gate if still empty
+    def _score_equities(df: pd.DataFrame) -> pd.DataFrame:
         w = _equity_weights(goal, horizon_years)
         score = (
-            _normalize(equities["3M Return"])   * w.get("mom3",0) +
-            _normalize(equities["6M Return"])   * w.get("mom6",0) +
-            _normalize(equities["12M Return"])  * w.get("mom12",0) +
-            _normalize(equities["Volatility"], invert=True) * w.get("vol",0) +
-            _normalize(equities["Max Drawdown"], invert=True) * w.get("dd",0) +
-            _normalize(equities["Dividend Yield"]) * w.get("yield",0)
+            _normalize(df["3M Return"])   * w.get("mom3",0) +
+            _normalize(df["6M Return"])   * w.get("mom6",0) +
+            _normalize(df["12M Return"])  * w.get("mom12",0) +
+            _normalize(df["Volatility"], invert=True) * w.get("vol",0) +
+            _normalize(df["Max Drawdown"], invert=True) * w.get("dd",0) +
+            _normalize(df["Dividend Yield"]) * w.get("yield",0)
         )
-        equities["Score"] = score.fillna(0.0)
-        equities = equities.sort_values(["Score","Avg Volume (60d)"], ascending=[False, False]).head(want_equities).reset_index(drop=True)
+        out = df.copy()
+        out["Score"] = score.fillna(0.0)
+        return out.sort_values(["Score","Avg Volume (60d)"], ascending=[False, False])
 
-    # ---- 2) Debt ETFs from StockAnalysis (title filter) ----
-    bond_etfs = fetch_bond_etfs_from_stockanalysis(max_check=bond_probe, parallel=6)
+    if eq.empty:
+        equities = pd.DataFrame(columns=["Ticker","Beta","Score"])
+    else:
+        view = eq[(eq["Beta"] >= min_beta) & (eq["Beta"] <= max_beta)].copy()
+        if view.empty:
+            # widen beta range once
+            widen = 0.3
+            view = eq[(eq["Beta"] >= (min_beta - widen)) & (eq["Beta"] <= (max_beta + widen))].copy()
+        if view.empty:
+            # no beta gate; rank by goal score
+            ranked = _score_equities(eq)
+        else:
+            ranked = _score_equities(view)
+
+        equities = ranked.head(want_equities).reset_index(drop=True)
+
+    # 3) Bond ETFs from StockAnalysis titles; validate by liquidity; fallback list if needed
+    found_bond = fetch_bond_etfs_from_stockanalysis(max_check=bond_probe, parallel=6)
 
     def _validate_rank_debt(tickers: List[str], want: int) -> pd.DataFrame:
         rows = []
@@ -319,11 +313,13 @@ def dynamic_universal_picker(
                 .reset_index(drop=True))
         return out
 
-    debt_df = _validate_rank_debt(bond_etfs, want_debt)
+    debt_df = _validate_rank_debt(found_bond, want_debt)
+    if debt_df.empty:
+        debt_df = _validate_rank_debt(FALLBACK_BOND_ETFS, want_debt)
 
     return equities, debt_df
 
-# -------------- Diagnostics (no Yahoo checks) --------------
+# ---------- Diagnostics (no Yahoo) ----------
 @st.cache_data(ttl=300)
 def probe_connectivity():
     out = {}
@@ -338,7 +334,6 @@ def probe_connectivity():
     except Exception as e:
         out["stockanalysis_sitemap"] = f"ERR: {e}"
     try:
-        # Tiny Stooq probe (ACWI via US ETF ACWI -> acwi.us)
         r = _session.get("https://stooq.com/q/d/l/?s=acwi.us&i=d", timeout=10)
         out["stooq_csv"] = r.status_code
     except Exception as e:
@@ -349,17 +344,17 @@ with st.expander("🔧 Diagnostics"):
     if st.button("Run connectivity tests"):
         st.write(probe_connectivity())
 
-# -------------- Run picker --------------
+# ---------- Run picker ----------
 if "user_inputs" in st.session_state:
     st.header("Step 2: Global Universe (from StockAnalysis) + Goal/Horizon Scoring")
     with st.spinner("Building universe, computing betas & scores..."):
         try:
             equities_df, debt_df = dynamic_universal_picker(
                 st.session_state["user_inputs"],
-                scan_cap_stock=400,   # adjust based on runtime budget
+                scan_cap_stock=500,   # bump up if you want deeper scan (tradeoff: time)
                 want_equities=50,
                 want_debt=30,
-                bond_probe=600
+                bond_probe=800
             )
         except Exception as e:
             st.error(f"Universe build failed: {e}")
@@ -367,7 +362,7 @@ if "user_inputs" in st.session_state:
 
     st.subheader("Candidate Equities")
     if equities_df.empty:
-        st.warning("No equities matched the beta range. Try a different risk profile.")
+        st.warning("No equities passed filters. Try another profile or widen the search later.")
     else:
         st.dataframe(equities_df, use_container_width=True)
 
