@@ -648,6 +648,6 @@ with st.expander("🔧 Diagnostics"):
         st.write(out)
 
 # ------------------- Learning Hub (optional) ------------------- #
-with st.expander("📚 Investor Academy (YouTube)"):
-    st.caption("Embed curated videos here with st.video(url). No API key required.")
-    # st.video("https://www.youtube.com/watch?v=dQw4w9WgXcQ")
+with st.expander("Investor Academy (YouTube)"):
+    st.caption("Learn more about Investment Management through Videos for better understanding.")
+    st.video("https://www.youtube.com/watch?v=_276IEO12sY")
