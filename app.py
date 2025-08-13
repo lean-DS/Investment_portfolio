@@ -19,7 +19,7 @@ import numpy as np
 import requests
 
 # ---- our helper module (place file next to app.py) ----
-from stockanalysis_scraper import (
+from stockanalysis_scrapper import (
     fetch_all_symbols_from_sitemaps,
     fetch_uk_epics_from_lists,
 )
