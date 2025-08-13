@@ -12,8 +12,8 @@ Original file is located at
 import re
 import time
 from typing import Dict, Iterable, List, Optional, Tuple
-from urllib import robotparser
 from urllib.parse import urljoin
+from urllib import robotparser
 
 import requests
 from bs4 import BeautifulSoup
@@ -24,10 +24,15 @@ SITEMAP_INDEX = urljoin(BASE, "/sitemap.xml")
 _session = requests.Session()
 _session.headers.update({
     "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-                  "(KHTML, like Gecko) Chrome/123.0 Safari/537.36"
+                  "(KHTML, like Gecko) Chrome/126.0 Safari/537.36",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
 })
 DEFAULT_TIMEOUT = 12
 
+# --------------------------------------------------------------------
+# Helpers
+# --------------------------------------------------------------------
 def _allowed(path: str) -> bool:
     rp = robotparser.RobotFileParser()
     rp.set_url(urljoin(BASE, "/robots.txt"))
@@ -35,6 +40,8 @@ def _allowed(path: str) -> bool:
         rp.read()
     except Exception:
         return False
+    # StockAnalysis robots often return False for /sitemap.xml, but content is public.
+    # We'll still check to be polite; if False, caller can decide what to do.
     return rp.can_fetch(_session.headers.get("User-Agent", "*"), urljoin(BASE, path))
 
 def _get(url: str) -> Optional[requests.Response]:
@@ -42,22 +49,32 @@ def _get(url: str) -> Optional[requests.Response]:
         r = _session.get(url, timeout=DEFAULT_TIMEOUT)
         if r.status_code == 200:
             return r
-        return None
     except Exception:
-        return None
+        pass
+    return None
+
+# --------------------------------------------------------------------
+# Sitemaps → US stocks & ETFs (strict symbol filtering)
+# --------------------------------------------------------------------
+# Allow tickers like: A, AA, BRK.B, RDS-A, VOD, VOD.L (we drop .L later if using Stooq)
+_TICKER_RE = re.compile(r"^[A-Za-z][A-Za-z0-9.\-]{0,9}$")
+
+# Common non-ticker slugs that appear under /stocks/ or /etf/ in sitemaps
+_DENY = {
+    "SCREENER","COMPARE","INDUSTRY","EARNINGS-CALENDAR","MARKETS","NEWS",
+    "PROVIDER","ECONOMY","INSIGHTS","LEARN","DIVIDENDS","IPO","LISTS","IDEAS",
+    "ETFS","SECTORS","INDEX","BLOG","ABOUT","CONTACT","JOBS","BROKERS","TOOLS"
+}
 
 def _iter_sitemaps() -> List[str]:
-    if not _allowed("/sitemap.xml"):
-        return []
     r = _get(SITEMAP_INDEX)
     if not r:
         return []
     soup = BeautifulSoup(r.text, "xml")
-    urls = [loc.get_text(strip=True) for loc in soup.find_all("loc")]
-    # Keep only stock/etf sitemaps
-    return [u for u in urls if ("/stocks/" in u.lower() or "/etf/" in u.lower())]
+    return [loc.get_text(strip=True) for loc in soup.find_all("loc")]
 
-def _extract_symbols_from_sitemap(sitemap_url: str) -> List[Tuple[str, str]]:
+def _extract_symbols_from_sitemap(sitemap_url: str, max_take: Optional[int]=None) -> List[Tuple[str, str]]:
+    """Return (symbol, kind) where kind in {'stocks','etf'} with strict filtering."""
     r = _get(sitemap_url)
     if not r:
         return []
@@ -66,94 +83,71 @@ def _extract_symbols_from_sitemap(sitemap_url: str) -> List[Tuple[str, str]]:
     for loc in soup.find_all("loc"):
         url = loc.get_text(strip=True)
         m = re.search(r"https?://stockanalysis\.com/(stocks|etf)/([A-Za-z0-9.\-]+)/?$", url)
-        if m:
-            kind, sym = m.group(1), m.group(2).upper()
-            out.append((sym, kind))  # kind is 'stocks' or 'etf'
-    return out
+        if not m:
+            continue
+        kind, raw = m.group(1), m.group(2).upper()
 
-def fetch_all_symbols_from_sitemaps(types: Iterable[str] = ("stock", "etf"),
-                                    max_per_type: int = 5000) -> Dict[str, List[str]]:
-    maps = _iter_sitemaps()
-    buckets: Dict[str, List[str]] = {"stock": [], "etf": []}
-    if not maps:
-        return buckets
-
-    want_stock = "stock" in types
-    want_etf = "etf" in types
-
-    # Walk through the child sitemaps, pick tickers
-    for sm in maps:
-        low = sm.lower()
-        is_stock_map = "/stocks/" in low
-        is_etf_map = "/etf/" in low
-        if (is_stock_map and not want_stock) or (is_etf_map and not want_etf):
+        # Filter out known non-ticker slugs and force a ticker-like shape
+        sym = raw.replace("/", "").upper()
+        if sym in _DENY:
+            continue
+        if not _TICKER_RE.fullmatch(sym):
             continue
 
-        time.sleep(0.5)  # polite throttle
+        out.append((sym, kind))
+        if max_take and len(out) >= max_take:
+            break
+    return out
+
+def fetch_all_symbols_from_sitemaps(types: Iterable[str] = ("stock","etf"),
+                                    max_per_type: int = 5000,
+                                    max_sitemaps: int = 10) -> Dict[str, List[str]]:
+    sitemaps = _iter_sitemaps()
+    stocks: List[str] = []
+    etfs: List[str] = []
+    for sm in sitemaps[:max_sitemaps]:
+        time.sleep(0.3)
         pairs = _extract_symbols_from_sitemap(sm)
         for sym, kind in pairs:
-            if kind == "stocks" and want_stock:
-                if sym not in buckets["stock"]:
-                    buckets["stock"].append(sym)
-            elif kind == "etf" and want_etf:
-                if sym not in buckets["etf"]:
-                    buckets["etf"].append(sym)
-
-        if want_stock and len(buckets["stock"]) >= max_per_type and \
-           want_etf   and len(buckets["etf"])   >= max_per_type:
+            if kind == "stocks" and "stock" in types:
+                if sym not in stocks:
+                    stocks.append(sym)
+            elif kind == "etf" and "etf" in types:
+                if sym not in etfs:
+                    etfs.append(sym)
+        if len(stocks) >= max_per_type and len(etfs) >= max_per_type:
             break
+    return {"stock": stocks[:max_per_type], "etf": etfs[:max_per_type]}
 
-    buckets["stock"] = buckets["stock"][:max_per_type]
-    buckets["etf"]   = buckets["etf"][:max_per_type]
-    return buckets
+# --------------------------------------------------------------------
+# UK universes (LSE + AIM list pages)
+# --------------------------------------------------------------------
+UK_LIST_PAGES = [
+    "/list/london-stock-exchange/",
+    "/list/london-stock-exchange-aim/",
+]
 
-# --------- Bond ETF detection (title-based, light HTML) ----------
-BOND_KEYWORDS = re.compile(
-    r"\b(bond|treasury|gilt|gilts|fixed income|aggregate|tips|inflation|credit|corporate|muni|municipal|duration|"
-    r"short-term|short term|intermediate|long-term|long term|t-bill|t bill)\b",
-    flags=re.IGNORECASE
-)
+def fetch_uk_epics_from_lists(max_pages: int = 2) -> List[str]:
+    """Scrape EPICs from /quote/lon/<EPIC>/ and also scan table cells."""
+    epics: set[str] = set()
+    for idx, path in enumerate(UK_LIST_PAGES[:max_pages]):
+        r = _get(urljoin(BASE, path))
+        if not r:
+            continue
+        soup = BeautifulSoup(r.text, "lxml")
 
-def _title_of(path: str) -> str:
-    if not _allowed(path):
-        return ""
-    r = _get(urljoin(BASE, path))
-    if not r:
-        return ""
-    soup = BeautifulSoup(r.text, "lxml")
-    return soup.title.get_text(" ", strip=True) if soup.title else ""
-
-def fetch_bond_etfs_from_stockanalysis(max_check: int = 800, parallel: int = 6) -> List[str]:
-    from concurrent.futures import ThreadPoolExecutor, as_completed
-    symbols = fetch_all_symbols_from_sitemaps(types=("etf",), max_per_type=max_check*2).get("etf", [])
-    if not symbols:
-        return []
-
-    candidates = symbols[:max_check]
-    paths = [f"/etf/{sym.lower()}/" for sym in candidates]
-    found: List[str] = []
-
-    def worker(path: str) -> Optional[str]:
-        time.sleep(0.15)
-        title = _title_of(path)
-        if title and BOND_KEYWORDS.search(title):
-            m = re.search(r"/etf/([a-z0-9.\-]+)/", path)
+        # 1) Preferred: /quote/lon/XXXX/
+        for a in soup.select("a[href]"):
+            href = a["href"]
+            m = re.search(r"/quote/(?:lon|lse)/([A-Za-z0-9.\-]+)/", href, flags=re.IGNORECASE)
             if m:
-                return m.group(1).upper()
-        return None
+                epics.add(m.group(1).upper())
 
-    with ThreadPoolExecutor(max_workers=max(1, min(parallel, 8))) as ex:
-        futs = [ex.submit(worker, p) for p in paths]
-        for f in as_completed(futs):
-            v = f.result()
-            if v:
-                found.append(v)
+        # 2) Fallback: 1–5 letters (ignore all-digit codes)
+        for td in soup.select("td"):
+            t = td.get_text(strip=True).upper()
+            if re.fullmatch(r"[A-Z]{1,5}(\.[A-Z])?", t):
+                epics.add(t)
 
-    # de-dupe
-    seen = set()
-    out = []
-    for s in found:
-        if s not in seen:
-            seen.add(s)
-            out.append(s)
-    return out
+        time.sleep(0.2)
+    return sorted(epics)
