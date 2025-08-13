@@ -21,7 +21,7 @@ import pandas as pd
 import requests
 import streamlit as st
 
-from stockanalysis_scraper import (
+from stockanalysis_scrapper import (
     fetch_all_symbols_from_sitemaps,
     fetch_bond_etfs_from_stockanalysis,
 )
