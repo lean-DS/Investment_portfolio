@@ -9,6 +9,9 @@ Original file is located at
 
 # app.py
 # app.py
+# --- Dynamic Portfolio Recommender (StockAnalysis + Stooq only; no Yahoo) ---
+
+import io
 import os
 import time
 from typing import List, Tuple
@@ -17,10 +20,8 @@ import numpy as np
 import pandas as pd
 import requests
 import streamlit as st
-import yfinance as yf
-from pandas_datareader import data as pdr
 
-from stockanalysis_scrapper import (
+from stockanalysis_scraper import (
     fetch_all_symbols_from_sitemaps,
     fetch_bond_etfs_from_stockanalysis,
 )
@@ -40,14 +41,12 @@ with c3:
 
 amount = st.number_input("Investment Amount (£)", min_value=1000, step=1000, value=10000)
 
-# Map risk → beta ranges
 def assign_beta_range(profile: str) -> Tuple[float, float]:
     if profile == "Low":    return (0.5, 1.0)
     if profile == "Medium": return (1.1, 1.3)
     return (1.4, 2.2)
 
 min_beta, max_beta = assign_beta_range(risk_profile)
-
 st.info(f"Target Beta: **{min_beta} – {max_beta}**")
 
 if st.button("Build Dynamic Universe"):
@@ -65,17 +64,55 @@ if st.button("Build Dynamic Universe"):
 _session = requests.Session()
 _session.headers.update({"User-Agent": "Mozilla/5.0"})
 
-# -------------- Data fetch fallbacks --------------
+# -------------- Symbol mapping for Stooq --------------
 def _to_stooq_symbol(yahoo_sym: str) -> str | None:
+    """
+    Map common Yahoo/US/LSE tickers to Stooq's scheme.
+    Examples: AAPL->aapl.us, VOD.L->vod.uk, ^GSPC->^spx, ^FTSE->^ftse
+    """
     s = yahoo_sym.strip().upper()
+    # Indices
     if s in {"^GSPC", "^SPX"}: return "^spx"
     if s in {"^FTSE"}:         return "^ftse"
+    # London
     if s.endswith(".L"):       return f"{s[:-2].lower()}.uk"
+    # US/common
     if s.isalpha() or "-" in s:
         return f"{s.lower()}.us"
     return None
 
+# -------------- Data fetch (Stooq CSV + optional Alpha Vantage) --------------
+def _stooq_download_ohlcv(yahoo_symbol: str) -> pd.DataFrame | None:
+    """
+    Download daily OHLCV from Stooq CSV (no pandas-datareader, no Yahoo).
+    """
+    stq = _to_stooq_symbol(yahoo_symbol)
+    if not stq:
+        return None
+    try:
+        url = f"https://stooq.com/q/d/l/?s={stq}&i=d"
+        r = _session.get(url, timeout=12)
+        if r.status_code != 200 or not r.text or r.text.strip().lower().startswith("error"):
+            return None
+        df = pd.read_csv(io.StringIO(r.text))
+        if df.empty or "Date" not in df.columns:
+            return None
+        # Normalize columns to match pipeline
+        rename = {c: c.capitalize() for c in ["open","high","low","close","volume"] if c in df.columns}
+        df.rename(columns=rename, inplace=True)
+        df["Date"] = pd.to_datetime(df["Date"])
+        df.set_index("Date", inplace=True)
+        for c in ["Open","High","Low","Close","Volume"]:
+            if c not in df.columns:
+                df[c] = np.nan
+        return df.sort_index()
+    except Exception:
+        return None
+
 def _alpha_vantage_close_series(symbol: str) -> pd.Series | None:
+    """
+    Optional fallback if Stooq lacks a symbol. Requires env var ALPHAVANTAGE_KEY.
+    """
     key = os.getenv("ALPHAVANTAGE_KEY")
     if not key:
         return None
@@ -95,70 +132,42 @@ def _alpha_vantage_close_series(symbol: str) -> pd.Series | None:
         return None
 
 def _download_ohlcv(ticker: str) -> pd.DataFrame | None:
-    # 1) Stooq
-    try:
-        stq = _to_stooq_symbol(ticker)
-        if stq:
-            df = pdr.DataReader(stq, "stooq")
-            if df is not None and not df.empty:
-                df = df.sort_index()
-                if "Close" not in df.columns and "close" in df.columns:
-                    df.rename(columns={"open":"Open","high":"High","low":"Low",
-                                       "close":"Close","volume":"Volume"}, inplace=True)
-                return df
-    except Exception:
-        pass
-    # 2) Alpha Vantage
+    """
+    Try Stooq CSV (preferred) → Alpha Vantage (close-only). No Yahoo fallback.
+    """
+    # 1) Stooq CSV
+    df = _stooq_download_ohlcv(ticker)
+    if df is not None and not df.empty:
+        return df
+
+    # 2) Alpha Vantage (close only)
     try:
         close = _alpha_vantage_close_series(ticker)
         if close is not None and not close.empty:
             return pd.DataFrame({"Close": close})
     except Exception:
         pass
-    # 3) yfinance
-    try:
-        df = yf.download(ticker, period="2y", interval="1d",
-                         progress=False, auto_adjust=False, threads=False, session=_session)
-        if df is not None and not df.empty:
-            return df
-    except Exception:
-        pass
+
     return None
 
-def _download_index_close(symbols=("ACWI", "SPY", "^GSPC", "VEU", "^FTSE")) -> pd.Series | None:
+def _download_index_close(symbols=("ACWI","SPY","^GSPC","VEU","^FTSE")) -> pd.Series | None:
+    """
+    Get a benchmark close series using Stooq CSV → Alpha Vantage. (No Yahoo)
+    """
     for sym in symbols:
-        # Stooq
-        try:
-            stq = _to_stooq_symbol(sym)
-            if stq:
-                df = pdr.DataReader(stq, "stooq")
-                if df is not None and not df.empty:
-                    df = df.sort_index()
-                    ser = (df["Close"] if "Close" in df.columns else df.iloc[:,0]).dropna()
-                    if not ser.empty:
-                        return ser
-        except Exception:
-            pass
-        # Alpha Vantage
-        try:
-            ser = _alpha_vantage_close_series(sym)
-            if ser is not None and not ser.empty:
+        df = _stooq_download_ohlcv(sym)
+        if df is not None and not df.empty and "Close" in df.columns:
+            ser = df["Close"].dropna()
+            if not ser.empty:
                 return ser
-        except Exception:
-            pass
-        # yfinance
-        try:
-            df = yf.download(sym, period="2y", interval="1d",
-                             progress=False, threads=False, session=_session)
-            if df is not None and not df.empty and "Close" in df.columns:
-                ser = df["Close"].dropna()
-                if not ser.empty:
-                    return ser
-        except Exception:
-            pass
+
+        ser = _alpha_vantage_close_series(sym)
+        if ser is not None and not ser.empty:
+            return ser
+
     return None
 
-# -------------- Feature & score --------------
+# -------------- Features & scoring --------------
 def _total_return(close: pd.Series, days: int) -> float:
     if len(close) < days + 1: return np.nan
     return float(close.iloc[-1] / close.iloc[-1 - days] - 1.0)
@@ -172,13 +181,31 @@ def _volatility(daily_ret: pd.Series) -> float:
     return float(daily_ret.std())
 
 def _ttm_dividend_yield(ticker: str, price_now: float) -> float:
+    """
+    TTM dividend yield via Alpha Vantage Monthly Adjusted ('7. dividend amount').
+    Returns 0.0 if no key or no data. Stooq doesn't provide dividends.
+    """
     try:
-        t = yf.Ticker(ticker, session=_session)
-        div = t.dividends
-        if div is None or div.empty or price_now <= 0: return 0.0
-        recent = div[div.index >= (div.index.max() - pd.Timedelta(days=365))]
-        total = float(recent.sum()) if not recent.empty else 0.0
-        return float(total / price_now)
+        if price_now <= 0:
+            return 0.0
+        key = os.getenv("ALPHAVANTAGE_KEY")
+        if not key:
+            return 0.0
+        url = "https://www.alphavantage.co/query"
+        params = {"function": "TIME_SERIES_MONTHLY_ADJUSTED", "symbol": ticker, "apikey": key}
+        r = _session.get(url, params=params, timeout=15)
+        j = r.json()
+        ts = j.get("Monthly Adjusted Time Series", {})
+        if not ts:
+            return 0.0
+        df = pd.DataFrame(ts).T
+        df.index = pd.to_datetime(df.index)
+        df = df.sort_index()
+        last12 = df.tail(12)
+        if "7. dividend amount" not in last12.columns:
+            return 0.0
+        ttm_div = pd.to_numeric(last12["7. dividend amount"], errors="coerce").fillna(0).sum()
+        return float(ttm_div / price_now)
     except Exception:
         return 0.0
 
@@ -200,10 +227,21 @@ def _equity_weights(goal: str, horizon_years: int) -> dict:
     return {"mom3":0.20 if short else 0.15, "mom6":0.20, "mom12":0.20,
             "vol":0.15, "dd":0.15, "yield":0.10 if not short else 0.05}
 
-# -------------- Core selection using Stock Analysis universes --------------
+def _calculate_beta_vs(close_stock: pd.Series, close_bench: pd.Series) -> float | None:
+    sret = close_stock.pct_change().dropna()
+    bret = close_bench.pct_change().dropna()
+    aligned = pd.concat([sret, bret], axis=1, join="inner").dropna()
+    if len(aligned) < 30: return None
+    aligned.columns = ["stock","bench"]
+    bvar = aligned["bench"].var()
+    if not bvar or pd.isna(bvar): return None
+    beta = aligned.cov().iloc[0,1] / bvar
+    return round(float(beta), 2)
+
+# -------------- Core selection using StockAnalysis universes --------------
 def dynamic_universal_picker(
     user_inputs: dict,
-    scan_cap_stock: int = 400,    # how many StockAnalysis 'stock' tickers to examine
+    scan_cap_stock: int = 400,    # how many StockAnalysis stock tickers to examine
     want_equities: int = 50,
     want_debt: int = 30,
     bond_probe: int = 600         # how many ETF pages to check titles for bond ETFs
@@ -216,7 +254,7 @@ def dynamic_universal_picker(
 
     bench = _download_index_close()
     if bench is None or bench.empty:
-        raise ValueError("Could not fetch benchmark data. Possible reasons: Yahoo Finance restriction, network issue, or invalid ticker.")
+        raise ValueError("Could not fetch benchmark data (Stooq/Alpha Vantage).")
 
     # ---- 1) Build equities universe from StockAnalysis (stocks only) ----
     sa = fetch_all_symbols_from_sitemaps(types=("stock", "etf"), max_per_type=5000)
@@ -237,7 +275,7 @@ def dynamic_universal_picker(
         mom12 = _total_return(close, 252)
         vol = _volatility(close.pct_change().dropna())
         mdd = _max_drawdown(close)
-        dy = _ttm_dividend_yield(t, float(close.iloc[-1]))
+        dy = _ttm_dividend_yield(t, float(close.iloc[-1])) if "Close" in df.columns else 0.0
         rows.append((t, beta, avg_vol, mom3, mom6, mom12, vol, mdd, dy))
 
     if not rows:
@@ -285,18 +323,7 @@ def dynamic_universal_picker(
 
     return equities, debt_df
 
-def _calculate_beta_vs(close_stock: pd.Series, close_bench: pd.Series) -> float | None:
-    sret = close_stock.pct_change().dropna()
-    bret = close_bench.pct_change().dropna()
-    aligned = pd.concat([sret, bret], axis=1, join="inner").dropna()
-    if len(aligned) < 30: return None
-    aligned.columns = ["stock","bench"]
-    bvar = aligned["bench"].var()
-    if not bvar or pd.isna(bvar): return None
-    beta = aligned.cov().iloc[0,1] / bvar
-    return round(float(beta), 2)
-
-# -------------- Diagnostics --------------
+# -------------- Diagnostics (no Yahoo checks) --------------
 @st.cache_data(ttl=300)
 def probe_connectivity():
     out = {}
@@ -306,22 +333,16 @@ def probe_connectivity():
     except Exception as e:
         out["google_ok"] = f"ERR: {e}"
     try:
-        r = _session.get("https://query2.finance.yahoo.com/v10/finance/quoteSummary/ACWI?modules=price", timeout=10)
-        out["yahoo_json"] = (r.status_code, r.headers.get("content-type", ""))
-        out["yahoo_json_snip"] = r.text[:120]
-    except Exception as e:
-        out["yahoo_json"] = f"ERR: {e}"
-    try:
-        df = yf.download("ACWI", period="5d", interval="1d", progress=False, threads=False, session=_session)
-        out["yfinance_shape"] = None if df is None else df.shape
-        out["yfinance_empty"] = (df is None) or df.empty
-    except Exception as e:
-        out["yfinance_error"] = f"ERR: {e}"
-    try:
         xml = _session.get("https://stockanalysis.com/sitemap.xml", timeout=10)
         out["stockanalysis_sitemap"] = xml.status_code
     except Exception as e:
         out["stockanalysis_sitemap"] = f"ERR: {e}"
+    try:
+        # Tiny Stooq probe (ACWI via US ETF ACWI -> acwi.us)
+        r = _session.get("https://stooq.com/q/d/l/?s=acwi.us&i=d", timeout=10)
+        out["stooq_csv"] = r.status_code
+    except Exception as e:
+        out["stooq_csv"] = f"ERR: {e}"
     return out
 
 with st.expander("🔧 Diagnostics"):
