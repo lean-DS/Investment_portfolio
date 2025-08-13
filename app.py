@@ -70,6 +70,26 @@ def save_cache(sym: str, df: pd.DataFrame) -> None:
 # =========================================================
 # Stooq mapping + fetchers (Stooq → Alpha Vantage fallback)
 # =========================================================
+
+
+def stooq_csv(symbol: str):
+    """
+    Download historical data for a given ticker from Stooq.
+    Example: stooq_csv('^SPX') for S&P 500.
+    Returns a pandas DataFrame with datetime index.
+    """
+    try:
+        url = f"https://stooq.com/q/d/l/?s={symbol.lower()}&i=d"
+        resp = requests.get(url, timeout=10)
+        resp.raise_for_status()
+        df = pd.read_csv(io.StringIO(resp.text))
+        df['Date'] = pd.to_datetime(df['Date'])
+        df.set_index('Date', inplace=True)
+        return df
+    except Exception as e:
+        print(f"Error fetching {symbol} from Stooq: {e}")
+        return pd.DataFrame()
+
 def to_stooq_symbol(sym: str) -> Optional[str]:
     s = sym.strip().upper()
     if s in {"^GSPC","^SPX"}: return "^spx"
@@ -79,20 +99,36 @@ def to_stooq_symbol(sym: str) -> Optional[str]:
         return f"{s.lower()}.us"
     return None
 
-def stooq_csv(symbol: str, interval="d") -> Optional[pd.DataFrame]:
+def stooq_csv(symbol: str, interval: str = "d") -> Optional[pd.DataFrame]:
+    """
+    Fetch OHLCV from Stooq. Returns None on HTML/error pages or malformed CSV.
+    """
     try:
         url = f"https://stooq.com/q/d/l/?s={symbol.lower()}&i={interval}"
         r = SESSION.get(url, timeout=TIMEOUT)
-        if r.status_code != 200 or not r.text or r.text.lower().startswith("error"):
+        if r.status_code != 200:
             return None
-        df = pd.read_csv(io.StringIO(r.text))
-        if df.empty or "Date" not in df.columns:
+        txt = r.text.strip()
+
+        # Stooq sometimes returns HTML (rate limit / error) with 200
+        if not txt or txt.startswith("<") or "404 Not Found" in txt or txt.lower().startswith("error"):
             return None
-        df["Date"] = pd.to_datetime(df["Date"])
-        df = df.sort_values("Date").reset_index(drop=True)
-        for c in ["Open","High","Low","Close","Volume"]:
+
+        df = pd.read_csv(io.StringIO(txt))
+        # Must have a header row with these names and at least a few rows
+        needed = {"Date", "Open", "High", "Low", "Close"}
+        if not needed.issubset(set(df.columns)) or len(df) < 5:
+            return None
+
+        df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
+        df = df.dropna(subset=["Date"]).sort_values("Date").reset_index(drop=True)
+
+        # Ensure numeric dtypes exist
+        for c in ["Open", "High", "Low", "Close", "Volume"]:
             if c not in df.columns:
                 df[c] = np.nan
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+
         return df
     except Exception:
         return None
@@ -155,14 +191,42 @@ def stooq_has_history(sym: str, min_rows: int = 500) -> bool:
 # =========================
 def choose_benchmark() -> Optional[pd.DataFrame]:
     """
-    Try a few Stooq benchmarks and return the first valid one.
-    Avoids 'DataFrame truth value is ambiguous' by not using `or` on DataFrames.
+    Find a reliable benchmark. Try Stooq first (multiple symbols + weekly fallback),
+    then fall back to Alpha Vantage (SPY/ACWI). Cache the result in session_state.
     """
-    for sym in ["^spx", "acwi.us", "^ftse"]:
-        df = stooq_csv(sym)
-        if df is not None and not df.empty and "Close" in df.columns:
+    # reuse if we already stored one
+    if "bench_df" in st.session_state:
+        df_cached = st.session_state["bench_df"]
+        if isinstance(df_cached, pd.DataFrame) and not df_cached.empty and "Close" in df_cached.columns:
+            return df_cached
+
+    # Stooq candidates (indexes & ETF proxies)
+    candidates = [
+        ("^spx", "d"), ("acwi.us", "d"), ("^ftse", "d"),
+        ("spy.us", "d"), ("ivv.us", "d"),
+        ("^spx", "w"), ("acwi.us", "w"), ("^ftse", "w")
+    ]
+    for sym, interval in candidates:
+        df = stooq_csv(sym, interval=interval)
+        if df is not None and not df.empty and "Close" in df.columns and len(df) > 100:
+            st.session_state["bench_df"] = df
             return df
+
+    # Alpha Vantage fallback (ETF proxies)
+    for sym in ["SPY", "ACWI", "IVV"]:
+        df = alpha_daily(sym)
+        if df is not None and not df.empty and "Close" in df.columns and len(df) > 100:
+            st.session_state["bench_df"] = df
+            return df
+
     return None
+
+with st.spinner("Fetching benchmark..."):
+    bench = choose_benchmark()
+    if bench is None or bench.empty or "Close" not in bench.columns:
+        st.error("Could not fetch a benchmark from Stooq or Alpha Vantage.")
+        st.stop()
+    bench_close = bench["Close"].dropna()
 
 # =========================================================
 # Universe loaders (CSV → scrape fallback → Stooq validation)
@@ -500,10 +564,15 @@ with st.expander("🔧 Diagnostics"):
             out["stockanalysis_sitemap"] = (r.status_code, len(r.text))
         except Exception as e:
             out["stockanalysis_sitemap"] = f"ERR: {e}"
+
+        # Inspect Stooq content (first 100 chars) instead of status only
         try:
-            r = SESSION.get("https://stooq.com/q/d/l/?s=acwi.us&i=d", timeout=8)
-            out["stooq_acwi"] = r.status_code
+            url = "https://stooq.com/q/d/l/?s=acwi.us&i=d"
+            r = SESSION.get(url, timeout=8)
+            sample = r.text[:100].replace("\n", "\\n") if r.status_code == 200 else ""
+            out["stooq_acwi"] = {"status": r.status_code, "sample": sample}
         except Exception as e:
             out["stooq_acwi"] = f"ERR: {e}"
+
         out["cache_files"] = len(list(CACHE_DIR.glob("*.parquet")))
         st.write(out)
