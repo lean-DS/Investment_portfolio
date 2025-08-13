@@ -20,7 +20,7 @@ import pandas as pd
 import numpy as np
 import requests
 
-from stockanalysis_scraper import (
+from stockanalysis_scrapper import (
     fetch_all_symbols_from_sitemaps,
     fetch_uk_epics_from_lists
 )
