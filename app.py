@@ -8,28 +8,29 @@ Original file is located at
 """
 
 # app.py
+# app.py
 import os
 import io
 import time
-from typing import List, Tuple, Dict, Optional
+from pathlib import Path
+from typing import List, Dict, Optional, Tuple
 
 import streamlit as st
 import pandas as pd
 import numpy as np
 import requests
 
-# ---- our helper module (place file next to app.py) ----
-from stockanalysis_scrapper import (
-    fetch_all_symbols_from_sitemaps,
-    fetch_uk_epics_from_lists,
+from stockanalysis_scraper import (
+    fetch_all_symbols_from_sitemaps,   # US stocks & ETFs
+    fetch_uk_epics_from_lists          # UK EPICs (LSE + AIM)
 )
 
 # ------------------- Page Setup ------------------- #
-st.set_page_config(page_title="Dynamic Portfolio Recommender", layout="centered")
+st.set_page_config(page_title="Dynamic Portfolio Recommender", layout="wide")
 st.title("Dynamic Portfolio Recommender")
 
 # =========================================================
-# Section 0: HTTP / data helpers (Stooq-based)
+# Global HTTP/session + cache + config
 # =========================================================
 SESSION = requests.Session()
 SESSION.headers.update({
@@ -38,28 +39,47 @@ SESSION.headers.update({
     "Accept": "*/*",
     "Accept-Language": "en-US,en;q=0.9",
 })
-STQ_TIMEOUT = 10
+TIMEOUT = 12
 
+ALPHA_KEY = os.getenv("ALPHAVANTAGE_API_KEY", "").strip()
+
+CACHE_DIR = Path("data_cache")
+CACHE_DIR.mkdir(exist_ok=True)
+
+def cache_path(sym: str) -> Path:
+    return CACHE_DIR / f"{sym.upper()}.parquet"
+
+def load_cache(sym: str) -> Optional[pd.DataFrame]:
+    p = cache_path(sym)
+    if p.exists():
+        try:
+            return pd.read_parquet(p)
+        except Exception:
+            return None
+    return None
+
+def save_cache(sym: str, df: pd.DataFrame) -> None:
+    try:
+        df.to_parquet(cache_path(sym), index=False)
+    except Exception:
+        pass
+
+# =========================================================
+# Stooq mapping + fetchers (Stooq → Alpha Vantage fallback)
+# =========================================================
 def to_stooq_symbol(sym: str) -> Optional[str]:
-    """Map a US or UK ticker to Stooq 's=' parameter. Returns None if we can't guess."""
     s = sym.strip().upper()
-    if s in {"^GSPC", "^SPX"}:
-        return "^spx"
-    if s in {"^FTSE"}:
-        return "^ftse"
-    # try explicit LSE suffix
-    if s.endswith(".L"):
-        return f"{s[:-2].lower()}.uk"
-    # EPICs like 'VOD' might be UK or US ADR; we'll first try US then '.uk' at callsites
+    if s in {"^GSPC","^SPX"}: return "^spx"
+    if s in {"^FTSE"}:        return "^ftse"
+    if s.endswith(".L"):      return f"{s[:-2].lower()}.uk"
     if s and any(c.isalpha() for c in s):
         return f"{s.lower()}.us"
     return None
 
 def stooq_csv(symbol: str, interval="d") -> Optional[pd.DataFrame]:
-    """Download OHLCV CSV from Stooq. Returns None on failure."""
     try:
-        url = f"https://stooq.com/q/d/l/?s={symbol}&i={interval}"
-        r = SESSION.get(url, timeout=STQ_TIMEOUT)
+        url = f"https://stooq.com/q/d/l/?s={symbol.lower()}&i={interval}"
+        r = SESSION.get(url, timeout=TIMEOUT)
         if r.status_code != 200 or not r.text or r.text.lower().startswith("error"):
             return None
         df = pd.read_csv(io.StringIO(r.text))
@@ -67,37 +87,80 @@ def stooq_csv(symbol: str, interval="d") -> Optional[pd.DataFrame]:
             return None
         df["Date"] = pd.to_datetime(df["Date"])
         df = df.sort_values("Date").reset_index(drop=True)
+        # ensure columns
+        for c in ["Open","High","Low","Close","Volume"]:
+            if c not in df.columns:
+                df[c] = np.nan
         return df
     except Exception:
         return None
 
-def fetch_ohlcv_any(sym: str, min_rows: int = 100) -> Optional[pd.DataFrame]:
+def alpha_daily(symbol: str) -> Optional[pd.DataFrame]:
+    if not ALPHA_KEY:
+        return None
+    try:
+        url = ("https://www.alphavantage.co/query"
+               f"?function=TIME_SERIES_DAILY_ADJUSTED&symbol={symbol}&outputsize=full&apikey={ALPHA_KEY}")
+        r = SESSION.get(url, timeout=20)
+        data = r.json().get("Time Series (Daily)")
+        if not data:
+            return None
+        df = (pd.DataFrame(data).T
+                .rename(columns={
+                    "1. open":"Open","2. high":"High","3. low":"Low","4. close":"Close",
+                    "6. volume":"Volume"
+                }))
+        for c in ["Open","High","Low","Close","Volume"]:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+        df.index = pd.to_datetime(df.index)
+        df = df.sort_index().reset_index().rename(columns={"index":"Date"})
+        return df
+    except Exception:
+        return None
+
+def fetch_ohlcv_any(sym: str, min_rows: int = 500) -> Optional[pd.DataFrame]:
     """
-    Try fetch from Stooq as US, then as UK (sym+'.L').
-    Return OHLCV df or None.
+    Unified loader with cache: Cache → Stooq (US) → Stooq (.L) → Alpha Vantage.
+    Ensures we can cover 1–2+ years for model features.
     """
-    # Try as-is (US guess)
+    cached = load_cache(sym)
+    if cached is not None and len(cached) >= min_rows:
+        return cached
+
+    # Stooq US guess
     stq = to_stooq_symbol(sym)
     if stq:
         df = stooq_csv(stq)
         if df is not None and len(df) >= min_rows:
+            save_cache(sym, df)
             return df
-    # Try LSE form
+
+    # Stooq LSE form
     stq2 = to_stooq_symbol(sym + ".L")
     if stq2:
         df2 = stooq_csv(stq2)
         if df2 is not None and len(df2) >= min_rows:
+            save_cache(sym, df2)
             return df2
+
+    # Alpha fallback (respect rate limits in batch jobs; here per-symbol)
+    df3 = alpha_daily(sym)
+    if df3 is not None and len(df3) >= min_rows:
+        save_cache(sym, df3)
+        return df3
+
     return None
 
-def stooq_has_history(sym: str, min_rows: int = 60) -> bool:
+def stooq_has_history(sym: str, min_rows: int = 500) -> bool:
     df = fetch_ohlcv_any(sym, min_rows=min_rows)
     return df is not None
 
+# =========================================================
+# Universe loaders (CSV → live scrape fallback → Stooq validation)
+# =========================================================
 def load_universe_csv(filename: str) -> List[str]:
-    """Load cached CSV with a 'Ticker' column."""
     try:
-        if os.path.exists(filename):
+        if Path(filename).exists():
             df = pd.read_csv(filename)
             col = next((c for c in df.columns if c.lower().startswith("ticker")), None)
             if col:
@@ -106,15 +169,72 @@ def load_universe_csv(filename: str) -> List[str]:
         pass
     return []
 
-# =========================================================
-# Section 1: UI — Investor Inputs
-# =========================================================
-st.header("Investor Profile")
+def get_equity_universe(max_us: int = 2000, max_uk: int = 2000) -> List[str]:
+    # Prefer CSV (you can pre-populate from reliable lists)
+    us = []
+    us += load_universe_csv("equities_us_sp500.csv")  # optional
+    if not us:
+        try:
+            sa = fetch_all_symbols_from_sitemaps(types=("stock",), max_per_type=max_us, max_sitemaps=10)
+            us = sa.get("stock", [])
+        except Exception:
+            us = []
 
-age = st.number_input("Enter your Age", min_value=18, max_value=100, value=30)
-goal = st.selectbox("What is your Investment Goal?", ["Capital Growth", "Dividend Income", "Balanced"])
-horizon = st.slider("Investment Horizon (in years)", 1, 15, 3)
-amount = st.number_input("Investment Amount (in £)", min_value=1000, step=1000, value=10000)
+    uk = []
+    uk += load_universe_csv("equities_uk_ftse100.csv")
+    uk += load_universe_csv("equities_uk_ftse250.csv")
+    if not uk:
+        try:
+            uk = fetch_uk_epics_from_lists()
+        except Exception:
+            uk = []
+
+    merged = list(dict.fromkeys(us + uk))[: (max_us + max_uk)]
+
+    # Validate via Stooq/AV (ensure 1–2y history)
+    valid = []
+    for s in merged:
+        if stooq_has_history(s, min_rows=500):  # ~2y of dailies
+            valid.append(s)
+        if len(valid) % 50 == 0:
+            time.sleep(0.15)
+    return valid
+
+def get_etf_universe(max_n: int = 4000) -> pd.DataFrame:
+    """
+    Return DataFrame with at least Ticker, Name (optional).
+    Prefers CSV 'etfs_master.csv' (columns: Ticker, Name?) then sitemap scrape.
+    """
+    # CSV first
+    if Path("etfs_master.csv").exists():
+        try:
+            df = pd.read_csv("etfs_master.csv")
+            if "Ticker" in df.columns:
+                df["Ticker"] = df["Ticker"].astype(str).str.upper()
+                return df.drop_duplicates("Ticker").head(max_n).reset_index(drop=True)
+        except Exception:
+            pass
+
+    # Fallback: sitemap ETFS (tickers only)
+    try:
+        sa = fetch_all_symbols_from_sitemaps(types=("etf",), max_per_type=max_n, max_sitemaps=10)
+        etfs = sa.get("etf", [])
+        return pd.DataFrame({"Ticker": list(dict.fromkeys(etfs))})
+    except Exception:
+        return pd.DataFrame({"Ticker": []})
+
+# =========================================================
+# Investor inputs (risk, goal, horizon) + beta window
+# =========================================================
+c1, c2, c3, c4 = st.columns(4)
+with c1:
+    age = st.number_input("Age", min_value=18, max_value=100, value=30)
+with c2:
+    goal = st.selectbox("Goal", ["Capital Growth", "Dividend Income", "Balanced"])
+with c3:
+    horizon = st.slider("Horizon (years)", 1, 15, 5)
+with c4:
+    amount = st.number_input("Amount (£)", min_value=1000, step=1000, value=10000)
 
 def recommend_risk_by_age(x: int) -> str:
     if x < 30: return "Aggressive"
@@ -122,74 +242,23 @@ def recommend_risk_by_age(x: int) -> str:
     return "Conservative"
 
 recommended_risk = recommend_risk_by_age(age)
-st.markdown(f"**System Recommendation:** Based on your age, you may consider a **{recommended_risk}** risk profile")
-
 risk_profile = st.selectbox(
-    "Select your Preferred Risk Profile",
+    "Risk Profile",
     ["Conservative", "Moderate", "Aggressive"],
     index=["Conservative", "Moderate", "Aggressive"].index(recommended_risk)
 )
+st.caption(f"System suggests: **{recommended_risk}**")
 
-def assign_beta_range(profile: str) -> Tuple[float, float]:
+def beta_window(profile: str) -> Tuple[float, float]:
     if profile == "Conservative": return (0.5, 1.0)
     if profile == "Moderate":     return (1.1, 1.3)
-    if profile == "Aggressive":   return (1.4, 2.2)
-    return (1.0, 1.3)
+    return (1.4, 2.2)
 
-min_beta, max_beta = assign_beta_range(risk_profile)
-st.success(f"Your Portfolio Beta Range: {min_beta} – {max_beta}")
-
-equity_percent = max(10, min(90, 100 - age))  # simple heuristic, lightly bounded
-debt_percent = 100 - equity_percent
-st.info(f"Suggested Split: **{equity_percent}% Equity**, **{debt_percent}% Debt/ETFs**")
+min_beta, max_beta = beta_window(risk_profile)
+st.info(f"Target Equity Beta Window: **{min_beta} – {max_beta}**")
 
 # =========================================================
-# Section 2: Universe builder (US + UK via StockAnalysis; validated with Stooq)
-# =========================================================
-st.header("Step 2: Global Universe (from StockAnalysis) + Goal/Horizon Scoring")
-
-def get_equity_universe(max_us: int = 1500, max_uk: int = 1200) -> List[str]:
-    """
-    1) Live scrape US from StockAnalysis sitemaps & UK EPICs from LSE/AIM pages.
-    2) If empty, load CSV caches.
-    3) Validate each symbol with Stooq; keep only those with history.
-    """
-    # --- Try live US ---
-    live_us = []
-    try:
-        sa = fetch_all_symbols_from_sitemaps(types=("stock",), max_per_type=max_us, max_sitemaps=10)
-        live_us = sa.get("stock", [])
-    except Exception:
-        pass
-
-    # --- Try live UK ---
-    live_uk = []
-    try:
-        live_uk = fetch_uk_epics_from_lists()
-    except Exception:
-        pass
-
-    # --- Fallback to cached CSVs if needed ---
-    if not live_us:
-        live_us = load_universe_csv("universe_us_stocks.csv")
-    if not live_uk:
-        live_uk = load_universe_csv("universe_uk_stocks.csv")
-
-    # Merge + small dedupe
-    merged = list(dict.fromkeys([*live_us[:max_us], *live_uk[:max_uk]]))
-
-    # Validate with Stooq (only keep symbols that have history)
-    valid: List[str] = []
-    for s in merged:
-        if stooq_has_history(s, min_rows=80):
-            valid.append(s)
-        # throttle a little to be polite
-        if len(valid) % 50 == 0:
-            time.sleep(0.2)
-    return valid
-
-# =========================================================
-# Section 3: Features, scoring, and selection
+# Features, scoring, and risk alignment
 # =========================================================
 def total_return(close: pd.Series, days: int) -> float:
     if len(close) <= days: return np.nan
@@ -197,16 +266,14 @@ def total_return(close: pd.Series, days: int) -> float:
 
 def max_drawdown(close: pd.Series) -> float:
     roll_max = close.cummax()
-    dd = (close / roll_max - 1.0)
-    return float(dd.min())
+    return float((close / roll_max - 1.0).min())
 
-def volatility(returns: pd.Series) -> float:
-    return float(returns.std())
+def volatility(ret: pd.Series) -> float:
+    return float(ret.std())
 
 def normalize(s: pd.Series, invert=False) -> pd.Series:
     s = s.replace([np.inf, -np.inf], np.nan)
-    if s.isna().all(): s = s.fillna(0.0)
-    else:              s = s.fillna(s.median())
+    s = s.fillna(s.median()) if not s.isna().all() else s.fillna(0.0)
     lo, hi = s.min(), s.max()
     out = pd.Series(0.5, index=s.index) if hi == lo else (s - lo) / (hi - lo)
     return 1 - out if invert else out
@@ -219,7 +286,6 @@ def equity_weights(goal: str, horizon_years: int) -> Dict[str, float]:
     if goal == "Dividend Income":
         return {"yield":0.55 if not short else 0.45, "vol":0.15, "dd":0.15,
                 "mom3":0.05, "mom6":0.05, "mom12":0.05}
-    # Balanced
     return {"mom3":0.20 if short else 0.15, "mom6":0.20, "mom12":0.20,
             "vol":0.15, "dd":0.15, "yield":0.10 if not short else 0.05}
 
@@ -227,132 +293,226 @@ def calc_beta(stock_close: pd.Series, bench_close: pd.Series) -> Optional[float]
     sret = stock_close.pct_change().dropna()
     bret = bench_close.pct_change().dropna()
     aligned = pd.concat([sret, bret], axis=1, join="inner").dropna()
-    if len(aligned) < 60: return None
-    aligned.columns = ["stock", "bench"]
-    var_b = aligned["bench"].var()
-    if var_b == 0 or pd.isna(var_b): return None
-    beta = aligned.cov().iloc[0, 1] / var_b
-    return round(float(beta), 2)
+    if len(aligned) < 120: return None
+    aligned.columns = ["stock","bench"]
+    vb = aligned["bench"].var()
+    if vb == 0 or pd.isna(vb): return None
+    return round(float(aligned.cov().iloc[0,1] / vb), 2)
 
-def dynamic_universe_picker(min_beta: float, max_beta: float,
-                            goal: str, horizon_years: int,
-                            scan_cap: int = 400, want_equities: int = 50
-                            ) -> pd.DataFrame:
-    """
-    1) Build validated universe (US+UK) from StockAnalysis (+ fallback CSVs).
-    2) Fetch ACWI (as benchmark) from Stooq.
-    3) Compute features + score and filter by beta window.
-    """
-    # 0) Benchmark (ACWI on Stooq is 'acwi.us')
-    bench = stooq_csv("acwi.us")
-    if bench is None or bench.empty:
-        bench = stooq_csv("^spx")  # last resort
-    if bench is None or bench.empty:
-        raise RuntimeError("Could not fetch a benchmark (ACWI/^SPX).")
+def apply_risk_constraints_to_equities(df: pd.DataFrame, risk: str) -> pd.DataFrame:
+    out = df.copy()
+    if risk == "Conservative":
+        out = out[(out["Volatility"] <= out["Volatility"].quantile(0.75)) &
+                  (out["Max Drawdown"] >= out["Max Drawdown"].quantile(0.25))]
+        out["BetaTilt"] = normalize(-np.abs(out["Beta"] - out["Beta"].min()))
+        out["Score"] = 0.9 * out["Score"] + 0.1 * out["BetaTilt"]
+    elif risk == "Aggressive":
+        mom_boost = normalize(out["3M Return"].fillna(0))*0.05 + normalize(out["12M Return"].fillna(0))*0.05
+        out["Score"] = out["Score"] + mom_boost
+    return out.sort_values("Score", ascending=False)
 
-    bench_close = bench["Close"].dropna()
+# ---- ETF categorization and profile scoring ----
+def etf_category_from_name(ticker: str, name: str = "") -> str:
+    t = f"{ticker} {name}".lower()
+    if any(k in t for k in ["ultra short","ultrashort","very short","t-bill","t bill","0-3","0-1","1-3",
+                            "short-term","short term","short duration","short maturity","shv","bil","shy"]):
+        return "short_duration_bond"
+    if any(k in t for k in ["intermediate","3-7","5-10","7-10","iei","govt","aggregate","agg",
+                            "core","total bond","intermediate-term"]):
+        return "intermediate_bond"
+    if any(k in t for k in ["long-term","long term","long duration","20+","10+","tlt","edv","zroz"]):
+        return "long_duration_bond"
+    if any(k in t for k in ["high yield","junk","hyg","jnk","sj nk"]):
+        return "high_yield_bond"
+    if any(k in t for k in ["corporate","credit","lqd","vcit","ig","investment grade"]):
+        return "ig_corporate_bond"
+    if any(k in t for k in ["treasury","gilt","gilts","tips","inflation","sovereign"]):
+        return "sovereign_bond"
+    return "other_bond"
 
-    # 1) Universe
-    all_syms = get_equity_universe()
-    if not all_syms:
-        return pd.DataFrame(columns=["Ticker", "Beta", "Score"])
+def etf_preference_weights(risk: str, goal: str, horizon_years: int) -> dict:
+    short = horizon_years < 3
+    if risk == "Conservative":
+        base = {"short_duration_bond":0.40 if short else 0.30, "intermediate_bond":0.30 if short else 0.35,
+                "sovereign_bond":0.20, "ig_corporate_bond":0.10,
+                "long_duration_bond":0.00, "high_yield_bond":0.00, "other_bond":0.00}
+    elif risk == "Moderate":
+        base = {"short_duration_bond":0.20 if short else 0.15, "intermediate_bond":0.35,
+                "sovereign_bond":0.15, "ig_corporate_bond":0.20,
+                "long_duration_bond":0.05 if not short else 0.00,
+                "high_yield_bond":0.05 if not short else 0.00, "other_bond":0.00}
+    else:
+        base = {"short_duration_bond":0.10 if short else 0.05, "intermediate_bond":0.25,
+                "sovereign_bond":0.10, "ig_corporate_bond":0.25,
+                "long_duration_bond":0.15 if not short else 0.05,
+                "high_yield_bond":0.15 if not short else 0.05, "other_bond":0.00}
+    if goal == "Dividend Income":
+        base["ig_corporate_bond"] += 0.05
+        base["high_yield_bond"]   += 0.05 if not short else 0.02
+    elif goal == "Capital Growth":
+        base["long_duration_bond"] += 0.05 if not short else 0.00
+        base["short_duration_bond"] -= 0.05 if not short else 0.00
+    s = sum(base.values()) or 1.0
+    return {k: v/s for k, v in base.items()}
 
-    # 2) Scan a subset for speed
-    rows = []
-    take = min(scan_cap, len(all_syms))
-    for sym in all_syms[:take]:
-        df = fetch_ohlcv_any(sym, min_rows=200)
+def score_etfs_by_profile(etf_df: pd.DataFrame, risk: str, goal: str, horizon_years: int) -> pd.DataFrame:
+    prefs = etf_preference_weights(risk, goal, horizon_years)
+    vols, cats = [], []
+    for i, row in etf_df.iterrows():
+        t = row["Ticker"]
+        nm = row.get("Name", "")
+        df = fetch_ohlcv_any(t, min_rows=300)
         if df is None or "Close" not in df.columns:
-            continue
-        close = df["Close"].dropna()
-        beta = calc_beta(close, bench_close)
-        if beta is None or not (min_beta <= beta <= max_beta):
-            continue
+            vols.append(np.nan); cats.append("other_bond"); continue
+        ret = df["Close"].pct_change().tail(60)
+        vols.append(float(ret.std()))
+        cats.append(etf_category_from_name(t, nm))
+    out = etf_df.copy()
+    out["Vol60"] = pd.to_numeric(pd.Series(vols), errors="coerce")
+    out["Category"] = cats
+    cat_score = out["Category"].map(prefs).fillna(0.0)
+    vol_score = 1 - normalize(out["Vol60"])
+    out["Score"] = 0.65 * cat_score + 0.35 * vol_score
+    return out.sort_values("Score", ascending=False)
 
-        # Features
-        mom3  = total_return(close, 63)
-        mom6  = total_return(close, 126)
-        mom12 = total_return(close, 252)
-        vol   = volatility(close.pct_change().dropna())
-        mdd   = max_drawdown(close)
-
-        # Dividend yield proxy: use Stooq 'Close' + try to fetch TTM dividend from Stooq is hard;
-        # here we skip or set to 0; you can plug a fundamental API later.
-        dy = 0.0
-
-        avg_vol = 0.0
-        if "Volume" in df.columns:
-            avg_vol = float(df["Volume"].tail(60).mean())
-
-        rows.append((sym, beta, avg_vol, mom3, mom6, mom12, vol, mdd, dy))
-
-    if not rows:
-        return pd.DataFrame(columns=["Ticker", "Beta", "Score"])
-
-    eq = pd.DataFrame(rows, columns=["Ticker","Beta","Avg Volume (60d)","3M Return","6M Return","12M Return","Volatility","Max Drawdown","Dividend Yield"])
-
-    # Score
-    w = equity_weights(goal, horizon_years)
-    score = (
-        normalize(eq["3M Return"])   * w.get("mom3",0) +
-        normalize(eq["6M Return"])   * w.get("mom6",0) +
-        normalize(eq["12M Return"])  * w.get("mom12",0) +
-        normalize(eq["Volatility"], invert=True) * w.get("vol",0) +
-        normalize(eq["Max Drawdown"], invert=True) * w.get("dd",0) +
-        normalize(eq["Dividend Yield"]) * w.get("yield",0)
-    )
-    eq["Score"] = score.fillna(0.0)
-    eq = eq.sort_values(["Score","Avg Volume (60d)"], ascending=[False, False]).head(want_equities).reset_index(drop=True)
-    return eq
+def select_bond_etfs(etf_pool: pd.DataFrame, risk: str, goal: str, horizon_years: int,
+                     want: int = 20) -> pd.DataFrame:
+    ranked = score_etfs_by_profile(etf_pool, risk, goal, horizon_years)
+    if len(ranked) >= want:
+        return ranked.head(want).reset_index(drop=True)
+    return ranked.head(want).reset_index(drop=True)
 
 # =========================================================
-# Section 4: Debt ETFs (dynamic via Stooq)
-# =========================================================
-# A liquid, broad set of USD bond ETFs that Stooq typically supports
-DEBT_ETF_CANDIDATES = [
-    "TLT","HYG","LQD","AGG","IEF","BND","EMB","MUB","BNDX","SHY","IEI","TIP","VCIT","LQDH","BSV","GOVT",
-    "IGSB","SPSB","SJNK","SHV","BIL","EDV","ZROZ","IEMB","IBTM.L","IGLT.L"  # a couple of LSE too
-]
-
-def rank_debt_etfs_by_liquidity(want: int = 30) -> pd.DataFrame:
-    rows = []
-    for t in DEBT_ETF_CANDIDATES:
-        df = fetch_ohlcv_any(t, min_rows=60)
-        if df is None or "Volume" not in df.columns:
-            continue
-        avgv = float(df["Volume"].tail(60).mean())
-        rows.append((t, avgv))
-    if not rows:
-        return pd.DataFrame(columns=["Ticker","Avg Volume (60d)"])
-    out = pd.DataFrame(rows, columns=["Ticker","Avg Volume (60d)"]).sort_values("Avg Volume (60d)", ascending=False)
-    return out.head(want).reset_index(drop=True)
-
-# =========================================================
-# Section 5: Run
+# Button: Build universe, compute scores, display
 # =========================================================
 if st.button("Build Dynamic Universe", type="primary"):
-    try:
-        with st.spinner("Building US+UK universe, fetching prices, and scoring..."):
-            equities_df = dynamic_universe_picker(
-                min_beta=min_beta, max_beta=max_beta,
-                goal=goal, horizon_years=horizon,
-                scan_cap=400, want_equities=50
-            )
+    with st.spinner("Fetching benchmark..."):
+        bench = stooq_csv("^spx") or stooq_csv("acwi.us")
+        if bench is None or bench.empty:
+            st.error("Could not fetch a benchmark from Stooq.")
+            st.stop()
+        bench_close = bench["Close"].dropna()
 
-        if equities_df.empty:
-            st.warning("No equities passed filters. Try another profile or widen the search later.")
-        else:
-            st.subheader("Candidate Equities")
-            st.dataframe(equities_df, use_container_width=True)
+    # ---------- Equities ----------
+    with st.spinner("Building equities universe (US + UK), fetching prices, and scoring..."):
+        syms = get_equity_universe()
+        if not syms:
+            st.error("No equity universe available (scrape and CSV fallback both empty).")
+            st.stop()
 
-        with st.spinner("Fetching bond ETFs and ranking by liquidity..."):
-            debt_df = rank_debt_etfs_by_liquidity(want=30)
+        rows = []
+        # Scan a bounded number for speed; increase if your runtime allows
+        scan_cap = min(800, len(syms))
+        for sym in syms[:scan_cap]:
+            df = fetch_ohlcv_any(sym, min_rows=500)
+            if df is None or "Close" not in df.columns: 
+                continue
+            close = df["Close"].dropna()
+            beta = calc_beta(close, bench_close)
+            if beta is None:
+                continue
+            # beta gate (auto-widen if too strict handled later)
+            if not (min_beta <= beta <= max_beta):
+                continue
 
-        st.subheader("Debt ETFs (ranked by liquidity)")
-        if debt_df.empty:
-            st.info("No bond ETFs found this run. Try again later.")
-        else:
-            st.dataframe(debt_df, use_container_width=True)
+            mom3  = total_return(close, 63)
+            mom6  = total_return(close, 126)
+            mom12 = total_return(close, 252)
+            vol   = volatility(close.pct_change().dropna())
+            mdd   = max_drawdown(close)
+            # yield proxy -> set 0.0 here (plug fundamentals later if needed)
+            dy = 0.0
+            avgv = float(df["Volume"].tail(60).mean()) if "Volume" in df.columns else 0.0
+            rows.append((sym, beta, avgv, mom3, mom6, mom12, vol, mdd, dy))
 
-    except Exception as e:
-        st.error(f"Universe build failed: {e}")
+        cols = ["Ticker","Beta","Avg Volume (60d)","3M Return","6M Return","12M Return","Volatility","Max Drawdown","Dividend Yield"]
+        eq = pd.DataFrame(rows, columns=cols) if rows else pd.DataFrame(columns=cols)
+
+        # If too few passed, widen beta once, then drop gate
+        want_equities = 50
+        if eq.empty or len(eq) < want_equities:
+            # widen by 0.3
+            widened_rows = []
+            for sym in syms[:scan_cap]:
+                df = fetch_ohlcv_any(sym, min_rows=500)
+                if df is None or "Close" not in df.columns: 
+                    continue
+                close = df["Close"].dropna()
+                beta = calc_beta(close, bench_close)
+                if beta is None or not (min_beta-0.3 <= beta <= max_beta+0.3):
+                    continue
+                mom3  = total_return(close, 63)
+                mom6  = total_return(close, 126)
+                mom12 = total_return(close, 252)
+                vol   = volatility(close.pct_change().dropna())
+                mdd   = max_drawdown(close)
+                dy = 0.0
+                avgv = float(df["Volume"].tail(60).mean()) if "Volume" in df.columns else 0.0
+                widened_rows.append((sym, beta, avgv, mom3, mom6, mom12, vol, mdd, dy))
+            if widened_rows:
+                eq = pd.DataFrame(widened_rows, columns=cols)
+
+        if eq.empty:
+            # final fallback: rank by score without beta gate
+            fb_rows = []
+            for sym in syms[:scan_cap]:
+                df = fetch_ohlcv_any(sym, min_rows=500)
+                if df is None or "Close" not in df.columns: 
+                    continue
+                close = df["Close"].dropna()
+                mom3  = total_return(close, 63)
+                mom6  = total_return(close, 126)
+                mom12 = total_return(close, 252)
+                vol   = volatility(close.pct_change().dropna())
+                mdd   = max_drawdown(close)
+                dy = 0.0
+                avgv = float(df["Volume"].tail(60).mean()) if "Volume" in df.columns else 0.0
+                fb_rows.append((sym, np.nan, avgv, mom3, mom6, mom12, vol, mdd, dy))
+            eq = pd.DataFrame(fb_rows, columns=cols) if fb_rows else pd.DataFrame(columns=cols)
+
+        # equity scoring
+        w = equity_weights(goal, horizon)
+        score = (
+            normalize(eq["3M Return"])   * w.get("mom3",0) +
+            normalize(eq["6M Return"])   * w.get("mom6",0) +
+            normalize(eq["12M Return"])  * w.get("mom12",0) +
+            normalize(eq["Volatility"], invert=True) * w.get("vol",0) +
+            normalize(eq["Max Drawdown"], invert=True) * w.get("dd",0) +
+            normalize(eq["Dividend Yield"]) * w.get("yield",0)
+        )
+        eq["Score"] = score.fillna(0.0)
+        eq = apply_risk_constraints_to_equities(eq, risk_profile)
+        top_equities = eq.head(want_equities).reset_index(drop=True)
+
+    st.subheader("Selected Equities (goal & risk aligned)")
+    st.dataframe(top_equities, use_container_width=True)
+
+    # ---------- ETFs ----------
+    with st.spinner("Building ETF pool, matching risk × goal × horizon, and guaranteeing ≥ 20..."):
+        etf_pool = get_etf_universe()
+        # optional: filter to bond/fixed-income ETFs only by name/ticker keywords
+        # Here we keep all ETFs and let the category scorer decide.
+        want_etfs = 20
+        top_etfs = select_bond_etfs(etf_pool, risk_profile, goal, horizon, want=want_etfs)
+
+    st.subheader("Recommended ETFs (bond sleeve; risk & goal aligned)")
+    st.dataframe(top_etfs[["Ticker","Category","Vol60","Score"]], use_container_width=True)
+
+# =========================================================
+# Diagnostics
+# =========================================================
+with st.expander("🔧 Diagnostics"):
+    if st.button("Run checks"):
+        out = {}
+        try:
+            r = SESSION.get("https://stockanalysis.com/sitemap.xml", timeout=8)
+            out["stockanalysis_sitemap"] = (r.status_code, len(r.text))
+        except Exception as e:
+            out["stockanalysis_sitemap"] = f"ERR: {e}"
+        try:
+            r = SESSION.get("https://stooq.com/q/d/l/?s=acwi.us&i=d", timeout=8)
+            out["stooq_acwi"] = r.status_code
+        except Exception as e:
+            out["stooq_acwi"] = f"ERR: {e}"
+        out["cache_files"] = len(list(CACHE_DIR.glob("*.parquet")))
+        st.write(out)
