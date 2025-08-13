@@ -8,6 +8,7 @@ Original file is located at
 """
 
 # stockanalysis_scraper.py
+# stockanalysis_scraper.py
 import re
 import time
 from typing import Dict, Iterable, List, Optional, Tuple
@@ -20,7 +21,6 @@ from bs4 import BeautifulSoup
 BASE = "https://stockanalysis.com"
 SITEMAP_INDEX = urljoin(BASE, "/sitemap.xml")
 
-# Polite session
 _session = requests.Session()
 _session.headers.update({
     "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
@@ -28,9 +28,7 @@ _session.headers.update({
 })
 DEFAULT_TIMEOUT = 12
 
-
 def _allowed(path: str) -> bool:
-    """Respect robots.txt."""
     rp = robotparser.RobotFileParser()
     rp.set_url(urljoin(BASE, "/robots.txt"))
     try:
@@ -38,7 +36,6 @@ def _allowed(path: str) -> bool:
     except Exception:
         return False
     return rp.can_fetch(_session.headers.get("User-Agent", "*"), urljoin(BASE, path))
-
 
 def _get(url: str) -> Optional[requests.Response]:
     try:
@@ -49,9 +46,7 @@ def _get(url: str) -> Optional[requests.Response]:
     except Exception:
         return None
 
-
 def _iter_sitemaps() -> List[str]:
-    """Return stock/ETF sitemaps from the index."""
     if not _allowed("/sitemap.xml"):
         return []
     r = _get(SITEMAP_INDEX)
@@ -59,16 +54,10 @@ def _iter_sitemaps() -> List[str]:
         return []
     soup = BeautifulSoup(r.text, "xml")
     urls = [loc.get_text(strip=True) for loc in soup.find_all("loc")]
-    out = []
-    for u in urls:
-        lu = u.lower()
-        if "stock" in lu or "etf" in lu:
-            out.append(u)
-    return out
-
+    # Keep only stock/etf sitemaps
+    return [u for u in urls if ("/stocks/" in u.lower() or "/etf/" in u.lower())]
 
 def _extract_symbols_from_sitemap(sitemap_url: str) -> List[Tuple[str, str]]:
-    """Parse a child sitemap → [(SYMBOL, kind='stocks'|'etf')]."""
     r = _get(sitemap_url)
     if not r:
         return []
@@ -82,13 +71,8 @@ def _extract_symbols_from_sitemap(sitemap_url: str) -> List[Tuple[str, str]]:
             out.append((sym, kind))  # kind is 'stocks' or 'etf'
     return out
 
-
 def fetch_all_symbols_from_sitemaps(types: Iterable[str] = ("stock", "etf"),
-                                    max_per_type: int = 4000) -> Dict[str, List[str]]:
-    """
-    Scrape via sitemaps only (static, JS-free). Returns:
-      {'stock': [...], 'etf': [...]}
-    """
+                                    max_per_type: int = 5000) -> Dict[str, List[str]]:
     maps = _iter_sitemaps()
     buckets: Dict[str, List[str]] = {"stock": [], "etf": []}
     if not maps:
@@ -97,52 +81,51 @@ def fetch_all_symbols_from_sitemaps(types: Iterable[str] = ("stock", "etf"),
     want_stock = "stock" in types
     want_etf = "etf" in types
 
+    # Walk through the child sitemaps, pick tickers
     for sm in maps:
         low = sm.lower()
-        is_stock_map = "stock" in low
-        is_etf_map = "etf" in low
+        is_stock_map = "/stocks/" in low
+        is_etf_map = "/etf/" in low
         if (is_stock_map and not want_stock) or (is_etf_map and not want_etf):
             continue
 
-        time.sleep(0.6)  # polite delay between XML hits
+        time.sleep(0.5)  # polite throttle
         pairs = _extract_symbols_from_sitemap(sm)
         for sym, kind in pairs:
-            if kind == "stocks" and want_stock and sym not in buckets["stock"]:
-                buckets["stock"].append(sym)
-            if kind == "etf" and want_etf and sym not in buckets["etf"]:
-                buckets["etf"].append(sym)
+            if kind == "stocks" and want_stock:
+                if sym not in buckets["stock"]:
+                    buckets["stock"].append(sym)
+            elif kind == "etf" and want_etf:
+                if sym not in buckets["etf"]:
+                    buckets["etf"].append(sym)
+
+        if want_stock and len(buckets["stock"]) >= max_per_type and \
+           want_etf   and len(buckets["etf"])   >= max_per_type:
+            break
 
     buckets["stock"] = buckets["stock"][:max_per_type]
-    buckets["etf"] = buckets["etf"][:max_per_type]
+    buckets["etf"]   = buckets["etf"][:max_per_type]
     return buckets
 
-
-# --------- Bond ETF detection (lightweight, title-based) ----------
+# --------- Bond ETF detection (title-based, light HTML) ----------
 BOND_KEYWORDS = re.compile(
     r"\b(bond|treasury|gilt|gilts|fixed income|aggregate|tips|inflation|credit|corporate|muni|municipal|duration|"
-    r"short-term|short term|intermediate|long-term|long term)\b",
+    r"short-term|short term|intermediate|long-term|long term|t-bill|t bill)\b",
     flags=re.IGNORECASE
 )
 
-
-def _title_of(url_path: str) -> str:
-    """Fetch <title> (small HTML parse, fast)."""
-    if not _allowed(url_path):
+def _title_of(path: str) -> str:
+    if not _allowed(path):
         return ""
-    r = _get(urljoin(BASE, url_path))
+    r = _get(urljoin(BASE, path))
     if not r:
         return ""
     soup = BeautifulSoup(r.text, "lxml")
     return soup.title.get_text(" ", strip=True) if soup.title else ""
 
-
-def fetch_bond_etfs_from_stockanalysis(max_check: int = 600, parallel: int = 6) -> List[str]:
-    """
-    Pull a limited set of ETF pages and classify by title → bond/treasury/gilt ETFs.
-    """
+def fetch_bond_etfs_from_stockanalysis(max_check: int = 800, parallel: int = 6) -> List[str]:
     from concurrent.futures import ThreadPoolExecutor, as_completed
-
-    symbols = fetch_all_symbols_from_sitemaps(types=("etf",)).get("etf", [])
+    symbols = fetch_all_symbols_from_sitemaps(types=("etf",), max_per_type=max_check*2).get("etf", [])
     if not symbols:
         return []
 
@@ -151,7 +134,7 @@ def fetch_bond_etfs_from_stockanalysis(max_check: int = 600, parallel: int = 6) 
     found: List[str] = []
 
     def worker(path: str) -> Optional[str]:
-        time.sleep(0.2)  # throttle inside workers
+        time.sleep(0.15)
         title = _title_of(path)
         if title and BOND_KEYWORDS.search(title):
             m = re.search(r"/etf/([a-z0-9.\-]+)/", path)
@@ -166,7 +149,7 @@ def fetch_bond_etfs_from_stockanalysis(max_check: int = 600, parallel: int = 6) 
             if v:
                 found.append(v)
 
-    # de-dupe, preserve order
+    # de-dupe
     seen = set()
     out = []
     for s in found:
