@@ -72,24 +72,6 @@ def save_cache(sym: str, df: pd.DataFrame) -> None:
 # =========================================================
 
 
-def stooq_csv(symbol: str):
-    """
-    Download historical data for a given ticker from Stooq.
-    Example: stooq_csv('^SPX') for S&P 500.
-    Returns a pandas DataFrame with datetime index.
-    """
-    try:
-        url = f"https://stooq.com/q/d/l/?s={symbol.lower()}&i=d"
-        resp = requests.get(url, timeout=10)
-        resp.raise_for_status()
-        df = pd.read_csv(io.StringIO(resp.text))
-        df['Date'] = pd.to_datetime(df['Date'])
-        df.set_index('Date', inplace=True)
-        return df
-    except Exception as e:
-        print(f"Error fetching {symbol} from Stooq: {e}")
-        return pd.DataFrame()
-
 def to_stooq_symbol(sym: str) -> Optional[str]:
     s = sym.strip().upper()
     if s in {"^GSPC","^SPX"}: return "^spx"
@@ -451,7 +433,7 @@ if st.button("Build Dynamic Universe", type="primary"):
     with st.spinner("Fetching benchmark..."):
         bench = choose_benchmark()
         if bench is None or bench.empty or "Close" not in bench.columns:
-            st.error("Could not fetch a benchmark from Stooq.")
+            st.error("Could not fetch a benchmark from Stooq or Alpha Vantage.")
             st.stop()
         bench_close = bench["Close"].dropna()
 
