@@ -20,13 +20,16 @@ import pandas as pd
 import numpy as np
 import requests
 
+# If you renamed this helper, keep the same names/exports:
+# fetch_all_symbols_from_sitemaps(types=("stock"|"etf",), max_per_type, max_sitemaps)
+# fetch_uk_epics_from_lists() -> list[str] of LSE symbols (without suffix or with .L)
 from stockanalysis_scrapper import (
     fetch_all_symbols_from_sitemaps,
     fetch_uk_epics_from_lists
 )
 
 # ─────────────────────────────────────────────────────────
-# Alpha Vantage key: env override, else fallback to hardcoded
+# Alpha Vantage key (env var preferred; fallback okay for dev)
 # ─────────────────────────────────────────────────────────
 ALPHA_KEY = os.getenv("ALPHAVANTAGE_API_KEY", "QC0N0N5TH9FGZIN6").strip()
 
@@ -44,7 +47,7 @@ SESSION.headers.update({
     "Accept": "*/*",
     "Accept-Language": "en-US,en;q=0.9",
 })
-TIMEOUT = 12
+TIMEOUT = 15
 
 CACHE_DIR = Path("data_cache")
 CACHE_DIR.mkdir(exist_ok=True)
@@ -68,10 +71,8 @@ def save_cache(sym: str, df: pd.DataFrame) -> None:
         pass
 
 # =========================================================
-# Stooq mapping + fetchers (Stooq → Alpha Vantage fallback)
+# Stooq helpers (no key; sometimes rate-limited silently)
 # =========================================================
-
-
 def to_stooq_symbol(sym: str) -> Optional[str]:
     s = sym.strip().upper()
     if s in {"^GSPC","^SPX"}: return "^spx"
@@ -81,23 +82,39 @@ def to_stooq_symbol(sym: str) -> Optional[str]:
         return f"{s.lower()}.us"
     return None
 
+def mark_stooq_limited():
+    st.session_state["stooq_limited"] = True
+
+def stooq_is_limited() -> bool:
+    return bool(st.session_state.get("stooq_limited", False))
+
 def stooq_csv(symbol: str, interval: str = "d") -> Optional[pd.DataFrame]:
     """
-    Fetch OHLCV from Stooq. Returns None on HTML/error pages or malformed CSV.
+    Fetch OHLCV from Stooq. Return None on HTML/error pages, rate-limit text,
+    or malformed CSV.
     """
     try:
         url = f"https://stooq.com/q/d/l/?s={symbol.lower()}&i={interval}"
         r = SESSION.get(url, timeout=TIMEOUT)
         if r.status_code != 200:
             return None
-        txt = r.text.strip()
 
-        # Stooq sometimes returns HTML (rate limit / error) with 200
-        if not txt or txt.startswith("<") or "404 Not Found" in txt or txt.lower().startswith("error"):
+        txt = (r.text or "").strip()
+        low = txt.lower()
+
+        # Treat these responses as failures (Stooq sometimes returns 200 + text)
+        if (
+            not txt
+            or txt.startswith("<")                     # HTML page
+            or "404 not found" in low
+            or low.startswith("error")
+            or "exceeded the daily hits limit" in low  # explicit rate-limit
+        ):
+            if "exceeded the daily hits limit" in low:
+                mark_stooq_limited()
             return None
 
         df = pd.read_csv(io.StringIO(txt))
-        # Must have a header row with these names and at least a few rows
         needed = {"Date", "Open", "High", "Low", "Close"}
         if not needed.issubset(set(df.columns)) or len(df) < 5:
             return None
@@ -105,7 +122,6 @@ def stooq_csv(symbol: str, interval: str = "d") -> Optional[pd.DataFrame]:
         df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
         df = df.dropna(subset=["Date"]).sort_values("Date").reset_index(drop=True)
 
-        # Ensure numeric dtypes exist
         for c in ["Open", "High", "Low", "Close", "Volume"]:
             if c not in df.columns:
                 df[c] = np.nan
@@ -115,52 +131,106 @@ def stooq_csv(symbol: str, interval: str = "d") -> Optional[pd.DataFrame]:
     except Exception:
         return None
 
-def alpha_daily(symbol: str) -> Optional[pd.DataFrame]:
-    if not ALPHA_KEY:
-        return None
-    try:
-        url = ("https://www.alphavantage.co/query"
-               f"?function=TIME_SERIES_DAILY_ADJUSTED&symbol={symbol}&outputsize=full&apikey={ALPHA_KEY}")
-        r = SESSION.get(url, timeout=20)
-        data = r.json().get("Time Series (Daily)")
-        if not data:
-            return None
-        df = (pd.DataFrame(data).T
-                .rename(columns={
-                    "1. open":"Open","2. high":"High","3. low":"Low","4. close":"Close",
-                    "6. volume":"Volume"
-                }))
-        for c in ["Open","High","Low","Close","Volume"]:
-            df[c] = pd.to_numeric(df[c], errors="coerce")
-        df.index = pd.to_datetime(df.index)
-        df = df.sort_index().reset_index().rename(columns={"index":"Date"})
-        return df
-    except Exception:
+# =========================================================
+# Alpha Vantage (robust CSV; UK .L → .LON mapping)
+# =========================================================
+def mark_av_limited():
+    st.session_state["av_limited"] = True
+
+def av_is_limited() -> bool:
+    return bool(st.session_state.get("av_limited", False))
+
+def to_alpha_symbol(sym: str) -> str:
+    """
+    Alpha Vantage expects LSE as .LON (e.g., TSCO.LON).
+    """
+    s = sym.strip().upper()
+    if s.endswith(".L"):    # map Yahoo/Stooq .L to AV .LON
+        return s[:-2] + ".LON"
+    return s
+
+def alpha_daily(symbol: str, outputsize: str = "full") -> Optional[pd.DataFrame]:
+    """
+    Robust Alpha Vantage DAILY_ADJUSTED via CSV.
+    Returns tidy DataFrame [Date, Open, High, Low, Close, Volume] or None.
+    """
+    key = ALPHA_KEY
+    if not key:
         return None
 
+    sym = to_alpha_symbol(symbol)
+    base = "https://www.alphavantage.co/query"
+    params = {
+        "function": "TIME_SERIES_DAILY_ADJUSTED",
+        "symbol": sym,
+        "outputsize": outputsize,   # 'compact' (~100 rows) or 'full'
+        "datatype": "csv",
+        "apikey": key,
+    }
+
+    for attempt in range(3):  # small retry/backoff
+        try:
+            r = SESSION.get(base, params=params, timeout=20)
+            txt = (r.text or "").strip()
+
+            # Throttle or error often returns JSON body even when datatype=csv
+            if txt.startswith("{"):
+                low = txt.lower()
+                if "note" in low or "error" in low or "information" in low:
+                    mark_av_limited()
+                    return None
+
+            df = pd.read_csv(io.StringIO(txt))
+            need = {"timestamp","open","high","low","close","volume"}
+            if not need.issubset({c.lower() for c in df.columns}) or len(df) < 5:
+                return None
+
+            # Normalize columns
+            cols_map = {"open":"Open","high":"High","low":"Low","close":"Close","volume":"Volume"}
+            df = df.rename(columns={"timestamp":"Date", **cols_map})
+            df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
+            df = df.dropna(subset=["Date"]).sort_values("Date").reset_index(drop=True)
+            for c in ["Open","High","Low","Close","Volume"]:
+                df[c] = pd.to_numeric(df[c], errors="coerce")
+            return df
+        except Exception:
+            pass
+        time.sleep(1.2 + attempt)  # gentle backoff
+
+    return None
+
+# =========================================================
+# Unified fetch with cache → Stooq → AV (no yfinance on cloud)
+# =========================================================
 def fetch_ohlcv_any(sym: str, min_rows: int = 500) -> Optional[pd.DataFrame]:
+    # 0) cache first
     cached = load_cache(sym)
     if cached is not None and len(cached) >= min_rows:
         return cached
 
-    stq = to_stooq_symbol(sym)
-    if stq:
-        df = stooq_csv(stq)
-        if df is not None and len(df) >= min_rows:
-            save_cache(sym, df)
-            return df
+    # 1) Try Stooq (skip if flagged limited)
+    if not stooq_is_limited():
+        stq = to_stooq_symbol(sym)
+        if stq:
+            df = stooq_csv(stq, interval="d")
+            if df is not None and len(df) >= min_rows:
+                save_cache(sym, df)
+                return df
 
-    stq2 = to_stooq_symbol(sym + ".L")
-    if stq2:
-        df2 = stooq_csv(stq2)
-        if df2 is not None and len(df2) >= min_rows:
-            save_cache(sym, df2)
-            return df2
+        # Also try ".L" mapping to .uk
+        stq2 = to_stooq_symbol(sym + ".L")
+        if stq2:
+            df2 = stooq_csv(stq2, interval="d")
+            if df2 is not None and len(df2) >= min_rows:
+                save_cache(sym, df2)
+                return df2
 
-    df3 = alpha_daily(sym)
-    if df3 is not None and len(df3) >= min_rows:
-        save_cache(sym, df3)
-        return df3
+    # 2) Alpha Vantage fallback (CSV)
+    if not av_is_limited():
+        df_av = alpha_daily(sym, outputsize="full")
+        if df_av is not None and len(df_av) >= min_rows:
+            save_cache(sym, df_av)
+            return df_av
 
     return None
 
@@ -169,34 +239,35 @@ def stooq_has_history(sym: str, min_rows: int = 500) -> bool:
     return df is not None
 
 # =========================
-# Benchmark chooser (FIX)
+# Robust benchmark chooser
 # =========================
 def choose_benchmark() -> Optional[pd.DataFrame]:
     """
-    Find a reliable benchmark. Try Stooq first (multiple symbols + weekly fallback),
-    then fall back to Alpha Vantage (SPY/ACWI). Cache the result in session_state.
+    Try multiple Stooq candidates (daily & weekly), then AV ETF proxies.
+    Cache in session_state to avoid repeated calls.
     """
-    # reuse if we already stored one
     if "bench_df" in st.session_state:
         df_cached = st.session_state["bench_df"]
         if isinstance(df_cached, pd.DataFrame) and not df_cached.empty and "Close" in df_cached.columns:
             return df_cached
 
-    # Stooq candidates (indexes & ETF proxies)
-    candidates = [
-        ("^spx", "d"), ("acwi.us", "d"), ("^ftse", "d"),
-        ("spy.us", "d"), ("ivv.us", "d"),
-        ("^spx", "w"), ("acwi.us", "w"), ("^ftse", "w")
+    stooq_candidates = [
+        ("^spx","d"), ("acwi.us","d"), ("^ftse","d"),
+        ("spy.us","d"), ("ivv.us","d"),
+        ("^spx","w"), ("acwi.us","w"), ("^ftse","w")
     ]
-    for sym, interval in candidates:
-        df = stooq_csv(sym, interval=interval)
+    for sym, interval in stooq_candidates:
+        df = stooq_csv(sym, interval)
         if df is not None and not df.empty and "Close" in df.columns and len(df) > 100:
             st.session_state["bench_df"] = df
             return df
 
-    # Alpha Vantage fallback (ETF proxies)
-    for sym in ["SPY", "ACWI", "IVV"]:
-        df = alpha_daily(sym)
+    # If we got here, Stooq probably limited
+    mark_stooq_limited()
+
+    # Alpha Vantage ETF proxies
+    for sym in ["SPY", "ACWI", "IVV", "VUSA.L"]:  # include LSE ETF proxy
+        df = alpha_daily(sym, outputsize="compact")
         if df is not None and not df.empty and "Close" in df.columns and len(df) > 100:
             st.session_state["bench_df"] = df
             return df
@@ -206,12 +277,12 @@ def choose_benchmark() -> Optional[pd.DataFrame]:
 with st.spinner("Fetching benchmark..."):
     bench = choose_benchmark()
     if bench is None or bench.empty or "Close" not in bench.columns:
-        st.error("Could not fetch a benchmark from Stooq or Alpha Vantage.")
+        st.error("Could not fetch a benchmark (Stooq rate-limited and Alpha Vantage unavailable). Check your AV key/quota.")
         st.stop()
     bench_close = bench["Close"].dropna()
 
 # =========================================================
-# Universe loaders (CSV → scrape fallback → Stooq validation)
+# Universe loaders (CSV → scrape fallback → history validation)
 # =========================================================
 def load_universe_csv(filename: str) -> List[str]:
     try:
@@ -225,6 +296,7 @@ def load_universe_csv(filename: str) -> List[str]:
     return []
 
 def get_equity_universe(max_us: int = 2000, max_uk: int = 2000) -> List[str]:
+    # Prefer your local CSVs if present
     us = []
     us += load_universe_csv("equities_us_sp500.csv")
     if not us:
@@ -243,8 +315,12 @@ def get_equity_universe(max_us: int = 2000, max_uk: int = 2000) -> List[str]:
         except Exception:
             uk = []
 
+    # normalize UK suffix to .L (we’ll remap per provider later)
+    uk = [s if s.endswith(".L") else f"{s}.L" for s in uk if isinstance(s, str) and s]
+
     merged = list(dict.fromkeys(us + uk))[: (max_us + max_uk)]
 
+    # keep only those we can actually fetch (at least 500 rows)
     valid = []
     for s in merged:
         if stooq_has_history(s, min_rows=500):
@@ -254,6 +330,7 @@ def get_equity_universe(max_us: int = 2000, max_uk: int = 2000) -> List[str]:
     return valid
 
 def get_etf_universe(max_n: int = 4000) -> pd.DataFrame:
+    # Prefer your curated CSV if present (Ticker,Name optional)
     if Path("etfs_master.csv").exists():
         try:
             df = pd.read_csv("etfs_master.csv")
@@ -262,10 +339,11 @@ def get_etf_universe(max_n: int = 4000) -> pd.DataFrame:
                 return df.drop_duplicates("Ticker").head(max_n).reset_index(drop=True)
         except Exception:
             pass
+    # Fallback: StockAnalysis sitemap (etf)
     try:
         sa = fetch_all_symbols_from_sitemaps(types=("etf",), max_per_type=max_n, max_sitemaps=10)
         etfs = sa.get("etf", [])
-        return pd.DataFrame({"Ticker": list(dict.fromkeys(etfs))})
+        return pd.DataFrame({"Ticker": list(dict.fromkeys([e.upper() for e in etfs]))})
     except Exception:
         return pd.DataFrame({"Ticker": []})
 
@@ -357,7 +435,7 @@ def apply_risk_constraints_to_equities(df: pd.DataFrame, risk: str) -> pd.DataFr
         out["Score"] = out["Score"] + mom_boost
     return out.sort_values("Score", ascending=False)
 
-# ETF scoring (same as before)
+# ETF heuristic categorization + scoring
 def etf_category_from_name(ticker: str, name: str = "") -> str:
     t = f"{ticker} {name}".lower()
     if any(k in t for k in ["ultra short","ultrashort","very short","t-bill","t bill","0-3","0-1","1-3",
@@ -368,7 +446,7 @@ def etf_category_from_name(ticker: str, name: str = "") -> str:
         return "intermediate_bond"
     if any(k in t for k in ["long-term","long term","long duration","20+","10+","tlt","edv","zroz"]):
         return "long_duration_bond"
-    if any(k in t for k in ["high yield","junk","hyg","jnk","sj nk"]):
+    if any(k in t for k in ["high yield","junk","hyg","jnk"]):
         return "high_yield_bond"
     if any(k in t for k in ["corporate","credit","lqd","vcit","ig","investment grade"]):
         return "ig_corporate_bond"
@@ -430,27 +508,22 @@ def select_bond_etfs(etf_pool: pd.DataFrame, risk: str, goal: str, horizon_years
 # Build button
 # =========================================================
 if st.button("Build Dynamic Universe", type="primary"):
-    with st.spinner("Fetching benchmark..."):
-        bench = choose_benchmark()
-        if bench is None or bench.empty or "Close" not in bench.columns:
-            st.error("Could not fetch a benchmark from Stooq or Alpha Vantage.")
-            st.stop()
-        bench_close = bench["Close"].dropna()
-
     # ---------- Equities ----------
     with st.spinner("Building equities universe (US + UK), fetching prices, and scoring..."):
+        bench_close = bench["Close"].dropna()
+
         syms = get_equity_universe()
         if not syms:
             st.error("No equity universe available (scrape and CSV fallback both empty).")
             st.stop()
 
         rows = []
-        scan_cap = min(800, len(syms))
+        scan_cap = min(800, len(syms))  # limit for speed/quota
         for sym in syms[:scan_cap]:
-            df = fetch_ohlcv_any(sym, min_rows=500)
-            if df is None or "Close" not in df.columns: 
+            dfp = fetch_ohlcv_any(sym, min_rows=500)
+            if dfp is None or "Close" not in dfp.columns: 
                 continue
-            close = df["Close"].dropna()
+            close = dfp["Close"].dropna()
             beta = calc_beta(close, bench_close)
             if beta is None:
                 continue
@@ -462,8 +535,8 @@ if st.button("Build Dynamic Universe", type="primary"):
             mom12 = total_return(close, 252)
             vol   = volatility(close.pct_change().dropna())
             mdd   = max_drawdown(close)
-            dy = 0.0
-            avgv = float(df["Volume"].tail(60).mean()) if "Volume" in df.columns else 0.0
+            dy = 0.0  # could compute from dividends if provider supports
+            avgv = float(dfp["Volume"].tail(60).mean()) if "Volume" in dfp.columns else 0.0
             rows.append((sym, beta, avgv, mom3, mom6, mom12, vol, mdd, dy))
 
         cols = ["Ticker","Beta","Avg Volume (60d)","3M Return","6M Return","12M Return","Volatility","Max Drawdown","Dividend Yield"]
@@ -474,10 +547,10 @@ if st.button("Build Dynamic Universe", type="primary"):
         if eq.empty or len(eq) < want_equities:
             widened_rows = []
             for sym in syms[:scan_cap]:
-                df = fetch_ohlcv_any(sym, min_rows=500)
-                if df is None or "Close" not in df.columns: 
+                dfp = fetch_ohlcv_any(sym, min_rows=500)
+                if dfp is None or "Close" not in dfp.columns: 
                     continue
-                close = df["Close"].dropna()
+                close = dfp["Close"].dropna()
                 beta = calc_beta(close, bench_close)
                 if beta is None or not (min_beta-0.3 <= beta <= max_beta+0.3):
                     continue
@@ -487,7 +560,7 @@ if st.button("Build Dynamic Universe", type="primary"):
                 vol   = volatility(close.pct_change().dropna())
                 mdd   = max_drawdown(close)
                 dy = 0.0
-                avgv = float(df["Volume"].tail(60).mean()) if "Volume" in df.columns else 0.0
+                avgv = float(dfp["Volume"].tail(60).mean()) if "Volume" in dfp.columns else 0.0
                 widened_rows.append((sym, beta, avgv, mom3, mom6, mom12, vol, mdd, dy))
             if widened_rows:
                 eq = pd.DataFrame(widened_rows, columns=cols)
@@ -495,17 +568,17 @@ if st.button("Build Dynamic Universe", type="primary"):
         if eq.empty:
             fb_rows = []
             for sym in syms[:scan_cap]:
-                df = fetch_ohlcv_any(sym, min_rows=500)
-                if df is None or "Close" not in df.columns: 
+                dfp = fetch_ohlcv_any(sym, min_rows=500)
+                if dfp is None or "Close" not in dfp.columns: 
                     continue
-                close = df["Close"].dropna()
+                close = dfp["Close"].dropna()
                 mom3  = total_return(close, 63)
                 mom6  = total_return(close, 126)
                 mom12 = total_return(close, 252)
                 vol   = volatility(close.pct_change().dropna())
                 mdd   = max_drawdown(close)
                 dy = 0.0
-                avgv = float(df["Volume"].tail(60).mean()) if "Volume" in df.columns else 0.0
+                avgv = float(dfp["Volume"].tail(60).mean()) if "Volume" in dfp.columns else 0.0
                 fb_rows.append((sym, np.nan, avgv, mom3, mom6, mom12, vol, mdd, dy))
             eq = pd.DataFrame(fb_rows, columns=cols) if fb_rows else pd.DataFrame(columns=cols)
 
@@ -541,20 +614,40 @@ if st.button("Build Dynamic Universe", type="primary"):
 with st.expander("🔧 Diagnostics"):
     if st.button("Run checks"):
         out = {}
+
+        # StockAnalysis sitemap presence
         try:
             r = SESSION.get("https://stockanalysis.com/sitemap.xml", timeout=8)
             out["stockanalysis_sitemap"] = (r.status_code, len(r.text))
         except Exception as e:
             out["stockanalysis_sitemap"] = f"ERR: {e}"
 
-        # Inspect Stooq content (first 100 chars) instead of status only
+        # Stooq sample (tells us if rate-limited)
         try:
             url = "https://stooq.com/q/d/l/?s=acwi.us&i=d"
             r = SESSION.get(url, timeout=8)
-            sample = r.text[:100].replace("\n", "\\n") if r.status_code == 200 else ""
+            sample = r.text[:120].replace("\n", "\\n") if r.status_code == 200 else ""
             out["stooq_acwi"] = {"status": r.status_code, "sample": sample}
+            if "exceeded the daily hits limit" in sample.lower():
+                mark_stooq_limited()
         except Exception as e:
             out["stooq_acwi"] = f"ERR: {e}"
 
         out["cache_files"] = len(list(CACHE_DIR.glob("*.parquet")))
+        out["stooq_limited"] = stooq_is_limited()
+        out["alpha_key_present"] = bool(ALPHA_KEY)
+        out["alpha_limited"] = av_is_limited()
+
+        # Quick AV sanity (compact to save quota)
+        try:
+            d = alpha_daily("SPY", outputsize="compact")
+            out["alpha_test_spy_ok"] = d is not None and not d.empty
+        except Exception as e:
+            out["alpha_test_spy_ok"] = f"ERR: {e}"
+
         st.write(out)
+
+# ------------------- Learning Hub (optional) ------------------- #
+with st.expander("📚 Investor Academy (YouTube)"):
+    st.caption("Embed curated videos here with st.video(url). No API key required.")
+    # st.video("https://www.youtube.com/watch?v=dQw4w9WgXcQ")
