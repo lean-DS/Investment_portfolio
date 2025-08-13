@@ -25,6 +25,8 @@ from stockanalysis_scraper import (
     fetch_uk_epics_from_lists          # UK EPICs (LSE + AIM)
 )
 
+os.environ["ALPHAVANTAGE_API_KEY"] = "QC0N0N5TH9FGZIN6"
+
 # ------------------- Page Setup ------------------- #
 st.set_page_config(page_title="Dynamic Portfolio Recommender", layout="wide")
 st.title("Dynamic Portfolio Recommender")
